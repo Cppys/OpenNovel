@@ -1,0 +1,16 @@
+langgraph>=0.2.0
+langchain-core>=0.3.0
+claude-agent-sdk>=0.1.0
+chromadb>=0.5.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+click>=8.0.0
+questionary>=2.0.0
+jieba>=0.42.1
+playwright>=1.40.0
+rich>=13.0.0
+sentence-transformers>=2.0.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0

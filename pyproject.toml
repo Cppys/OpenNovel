@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opennovel"
+version = "0.2.0"
+description = "Multi-agent workflow for automated novel writing and publishing on Fanqie Novel"
+requires-python = ">=3.10"
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+    "claude-agent-sdk>=0.1.0",
+    "chromadb>=0.5.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "click>=8.0.0",
+    "jieba>=0.42.1",
+    "playwright>=1.40.0",
+    "rich>=13.0.0",
+    "textual>=0.50.0",
+    "sentence-transformers>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+]
+web = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "jinja2>=3.1.0",
+]
+
+[project.scripts]
+opennovel = "cli.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["config*", "models*", "memory*", "agents*", "tools*", "publisher*", "workflow*", "cli*", "web*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "manual: marks tests that require manual interaction (browser login etc.)",
+    "integration: marks tests that call real external APIs (require valid credentials in .env)",
+]
