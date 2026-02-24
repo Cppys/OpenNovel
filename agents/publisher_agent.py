@@ -30,8 +30,10 @@ class PublisherAgent:
         """Launch Playwright browser.
 
         Args:
-            headless:       Run headless.  Fanqie's bot-detection redirects to
-                            login when True, so publish flows default to False.
+            headless:       Run headless.  Ignored when use_auth_state=True —
+                            headless mode is then determined automatically:
+                            True when auth_state.json exists (silent), False
+                            when it doesn't (interactive QR-code login).
             use_auth_state: Load cookies / localStorage from the saved
                             auth_state.json produced by setup-browser.
         """
@@ -40,7 +42,9 @@ class PublisherAgent:
             auth_path = Path(self.settings.auth_state_path)
             if auth_path.exists():
                 storage_state = str(auth_path)
+                headless = True   # cookie已存在，静默运行，无需弹窗
             else:
+                headless = False  # 需要扫码登录，必须显示窗口
                 logger.warning(
                     "auth_state.json not found at %s — please run 'opennovel setup-browser' first",
                     auth_path,
@@ -138,7 +142,7 @@ class PublisherAgent:
 
     async def _run_get_book_list(self) -> list[dict]:
         try:
-            await self.launch_browser(headless=False, use_auth_state=True)
+            await self.launch_browser(use_auth_state=True)
             if not await self.ensure_logged_in():
                 return []
             return await self._get_client().get_book_list()
@@ -149,8 +153,7 @@ class PublisherAgent:
         self, book_id: str, chapters: list[dict], publish_mode: str,
     ) -> list[dict]:
         try:
-            # Use saved auth state; headless=False avoids Fanqie's bot detection
-            await self.launch_browser(headless=False, use_auth_state=True)
+            await self.launch_browser(use_auth_state=True)
             if not await self.ensure_logged_in():
                 return [{
                     "success": False,
@@ -170,7 +173,7 @@ class PublisherAgent:
         protagonist_name_2: str = "",
     ) -> str:
         try:
-            await self.launch_browser(headless=False, use_auth_state=True)
+            await self.launch_browser(use_auth_state=True)
             if not await self.ensure_logged_in():
                 logger.error("Login failed, cannot create book")
                 return ""
