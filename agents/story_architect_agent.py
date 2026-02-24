@@ -70,7 +70,7 @@ class StoryArchitectAgent(BaseAgent):
         raw_text = await self.llm.chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            model=self.settings.llm_model_planning,
+            model=self.settings.llm_model_story_architect,
         )
 
         result = self._parse_architecture(raw_text, premise)

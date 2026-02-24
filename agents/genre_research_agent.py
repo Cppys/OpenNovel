@@ -45,7 +45,7 @@ class GenreResearchAgent(BaseAgent):
         result = await self.llm.chat_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            model=self.settings.llm_model_planning,
+            model=self.settings.llm_model_genre_research,
         )
 
         # Ensure all expected keys exist

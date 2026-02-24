@@ -29,7 +29,11 @@ class TestSettingsDefaults:
         )
         assert s.llm_model_writing == "claude-opus-4-6"
         assert s.llm_model_editing == "claude-opus-4-6"
-        assert s.llm_model_planning == "claude-opus-4-6"
+        assert s.llm_model_reviewing == "claude-opus-4-6"
+        assert s.llm_model_genre_research == "claude-opus-4-6"
+        assert s.llm_model_story_architect == "claude-opus-4-6"
+        assert s.llm_model_conflict_design == "claude-opus-4-6"
+        assert s.llm_model_memory == "claude-haiku-4-5"
 
 
 class TestSettingsValidation:

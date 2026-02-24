@@ -60,7 +60,11 @@ def mock_llm():
     llm.settings = MagicMock()
     llm.settings.llm_model_writing = "claude-opus-4-6"
     llm.settings.llm_model_editing = "claude-opus-4-6"
-    llm.settings.llm_model_planning = "claude-opus-4-6"
+    llm.settings.llm_model_reviewing = "claude-opus-4-6"
+    llm.settings.llm_model_genre_research = "claude-opus-4-6"
+    llm.settings.llm_model_story_architect = "claude-opus-4-6"
+    llm.settings.llm_model_conflict_design = "claude-opus-4-6"
+    llm.settings.llm_model_memory = "claude-haiku-4-5"
     llm.settings.chapter_min_chars = 100
     llm.settings.chapter_max_chars = 200
     return llm
@@ -77,7 +81,11 @@ def mock_agent_sdk():
     llm.settings = MagicMock()
     llm.settings.llm_model_writing = "claude-opus-4-6"
     llm.settings.llm_model_editing = "claude-opus-4-6"
-    llm.settings.llm_model_planning = "claude-opus-4-6"
+    llm.settings.llm_model_reviewing = "claude-opus-4-6"
+    llm.settings.llm_model_genre_research = "claude-opus-4-6"
+    llm.settings.llm_model_story_architect = "claude-opus-4-6"
+    llm.settings.llm_model_conflict_design = "claude-opus-4-6"
+    llm.settings.llm_model_memory = "claude-haiku-4-5"
     llm.settings.chapter_min_chars = 100
     llm.settings.chapter_max_chars = 200
     return llm

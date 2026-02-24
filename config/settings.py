@@ -16,10 +16,14 @@ class Settings(BaseSettings):
     Rate limiting is handled by the SDK itself.
     """
 
-    # LLM Models (Agent SDK supports model selection)
-    llm_model_writing: str = "claude-opus-4-6"
-    llm_model_editing: str = "claude-opus-4-6"
-    llm_model_planning: str = "claude-opus-4-6"
+    # LLM Models — one per agent role
+    llm_model_writing: str = "claude-opus-4-6"         # WriterAgent
+    llm_model_editing: str = "claude-opus-4-6"         # EditorAgent
+    llm_model_reviewing: str = "claude-opus-4-6"       # ReviewerAgent
+    llm_model_genre_research: str = "claude-opus-4-6"  # GenreResearchAgent
+    llm_model_story_architect: str = "claude-opus-4-6" # StoryArchitectAgent
+    llm_model_conflict_design: str = "claude-opus-4-6" # ConflictDesignAgent
+    llm_model_memory: str = "claude-haiku-4-5"         # MemoryManagerAgent / Summarizer
 
     # Database
     sqlite_db_path: Path = Path("./data/novels.db")

@@ -78,7 +78,7 @@ class ReviewerAgent(BaseAgent):
             result_text = await self.llm.chat(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                model=self.settings.llm_model_editing,
+                model=self.settings.llm_model_reviewing,
             )
 
             result = parse_json_response(result_text)

@@ -236,7 +236,7 @@ class Summarizer:
         raw_text = await self.llm.chat(
             system_prompt=_SUMMARY_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            model=self.llm.settings.llm_model_editing,
+            model=self.llm.settings.llm_model_memory,
         )
 
         result = _parse_chapter_summary(raw_text)
@@ -268,7 +268,7 @@ class Summarizer:
         raw_text = await self.llm.chat(
             system_prompt=_GLOBAL_REVIEW_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            model=self.llm.settings.llm_model_writing,
+            model=self.llm.settings.llm_model_memory,
         )
 
         result = _parse_global_review(raw_text)

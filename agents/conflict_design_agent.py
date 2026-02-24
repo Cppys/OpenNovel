@@ -71,7 +71,7 @@ class ConflictDesignAgent(BaseAgent):
         raw_text = await self.llm.chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            model=self.settings.llm_model_planning,
+            model=self.settings.llm_model_conflict_design,
         )
 
         result = self._parse_chapters(raw_text, architecture)
@@ -235,7 +235,7 @@ class ConflictDesignAgent(BaseAgent):
         raw_text = await self.llm.chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            model=self.settings.llm_model_planning,
+            model=self.settings.llm_model_conflict_design,
         )
 
         chapters = self._parse_volume_chapters(raw_text, chapter_start, chapter_end)
