@@ -4,7 +4,7 @@ import logging
 import os
 import shutil
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 from claude_agent_sdk import (
     query,
@@ -62,6 +62,7 @@ class AgentSDKClient:
         user_prompt: str,
         model: Optional[str] = None,
         max_turns: int = 1,
+        on_event: Optional[Callable[[dict], None]] = None,
     ) -> str:
         """Send a request and return the text result.
 
@@ -70,6 +71,10 @@ class AgentSDKClient:
             user_prompt: User message content.
             model: Model name override. Defaults to writing model.
             max_turns: Maximum agentic turns.
+            on_event: Optional callback fired with progress events:
+                      {"type": "thinking", "text": str}  — model is reasoning
+                      {"type": "text",     "text": str}  — first text chunk
+                      {"type": "result"}                 — final result ready
 
         Returns:
             The model's text response.
@@ -84,6 +89,7 @@ class AgentSDKClient:
 
         try:
             result_text = ""
+            _text_fired = False
             # IMPORTANT: Do NOT return/break early from inside the async for loop.
             # The query() generator uses anyio cancel scopes internally; exiting
             # the loop prematurely causes "Attempted to exit cancel scope in a
@@ -103,15 +109,23 @@ class AgentSDKClient:
                         len(result_text),
                         message.total_cost_usd,
                     )
+                    if on_event:
+                        on_event({"type": "result"})
                 elif isinstance(message, AssistantMessage):
-                    # Accumulate text from assistant messages as fallback
-                    if not result_text:
-                        parts = []
-                        for block in message.content:
-                            if hasattr(block, "text"):
-                                parts.append(block.text)
-                        if parts:
-                            result_text = "".join(parts)
+                    for block in message.content:
+                        block_type = getattr(block, "type", None)
+                        if block_type == "thinking":
+                            thinking = getattr(block, "thinking", "")
+                            if thinking and on_event:
+                                on_event({"type": "thinking", "text": thinking})
+                        else:
+                            text = getattr(block, "text", None)
+                            if text:
+                                if on_event and not _text_fired:
+                                    _text_fired = True
+                                    on_event({"type": "text", "text": text})
+                                if not result_text:
+                                    result_text += text
         except Exception as e:
             raise LLMError(f"Agent SDK query failed: {e}") from e
 

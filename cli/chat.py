@@ -11,6 +11,8 @@ from typing import Optional
 
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 from rich import box
@@ -205,11 +207,28 @@ def render_welcome(console, novel: Optional[Novel], db: Optional[Database] = Non
 
 
 def render_ai_response(console, text: str):
-    """用 Rich Markdown 渲染 AI 回复。"""
+    """用 Rich Markdown 渲染 AI 回复，带视觉标题。"""
     console.print()
+    console.print(Text("◆", style="bold cyan"), end="  ")
     console.print(Markdown(text))
     console.print()
 
+
+# ── 动作标签（用于状态显示）──────────────────────────────────────────────
+
+_ACTION_LABELS: dict[str, str] = {
+    "create_novel":     "创建小说",
+    "write_chapters":   "写章节",
+    "read_chapter":     "读取章节",
+    "read_outline":     "读取大纲",
+    "edit_chapter":     "修改章节",
+    "list_chapters":    "获取章节列表",
+    "list_characters":  "获取角色列表",
+    "switch_novel":     "切换小说",
+    "list_novels":      "获取小说列表",
+    "delete_novel":     "删除小说",
+    "publish_chapters": "上传番茄",
+}
 
 # ── 动作系统提示 ──────────────────────────────────────────────────────────
 
@@ -316,6 +335,55 @@ class ChatSession:
 
     # ── 消息发送与动作执行 ────────────────────────────────────────────
 
+    async def _llm_with_spinner(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        label: str = "思考中",
+    ) -> str:
+        """调用 LLM，同时用 Rich Live 显示动画状态指示器。
+
+        状态变化：
+          💭 思考中… → ✍️ 回复中… → (done, spinner disappears)
+        """
+        _phase: list[str] = [label]   # mutable for closure
+        _live_ref: list = [None]
+
+        def _make_renderable():
+            if _phase[0] == "回复中":
+                icon, txt = "✍️ ", "回复中"
+            else:
+                icon, txt = "💭 ", _phase[0]
+            return Spinner("dots", text=Text.from_markup(f"  {icon}[dim]{txt}…[/dim]"))
+
+        def on_event(event: dict):
+            etype = event.get("type")
+            live = _live_ref[0]
+            if etype == "thinking" and _phase[0] == label:
+                _phase[0] = "思考中"
+                if live:
+                    live.update(_make_renderable())
+            elif etype == "text" and _phase[0] != "回复中":
+                _phase[0] = "回复中"
+                if live:
+                    live.update(_make_renderable())
+
+        with Live(
+            _make_renderable(),
+            console=self.console,
+            refresh_per_second=12,
+            transient=True,
+        ) as live:
+            _live_ref[0] = live
+            result = await self.llm.chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=self.settings.llm_model_writing,
+                on_event=on_event,
+            )
+
+        return result
+
     async def send(self, user_message: str) -> None:
         """发送消息、解析动作、执行动作；AI 可自动多步骤继续直到完成。
 
@@ -323,23 +391,17 @@ class ChatSession:
         """
         MAX_AUTO_CONTINUES = 5
 
-        # ── 第一次 LLM 调用 ──
+        # ── 第一次 LLM 调用（带动画状态）──
         system_prompt = self.build_system_prompt()
         user_prompt = self.format_user_prompt(user_message)
 
-        response = await self.llm.chat(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=self.settings.llm_model_writing,
-        )
+        response = await self._llm_with_spinner(system_prompt, user_prompt)
         text, actions = parse_ai_response(response)
 
         self.history.append(("user", user_message))
         self.history.append(("assistant", text))
 
-        # 渲染首次回复
         if text.strip():
-            self.console.print("AI>", style="bold cyan", end=" ")
             render_ai_response(self.console, text)
 
         # ── 自动继续循环（AI 执行 action 后继续思考）──
@@ -347,38 +409,29 @@ class ChatSession:
             if not actions:
                 break
 
-            # 执行所有动作，收集结果
             action_results = []
             for action in actions:
                 result = await self.execute_action(action)
                 action_results.append(result)
 
-            # 将结果作为新 Human 轮次传给 LLM，并加入历史
             result_text = (
                 "[系统] 动作执行结果：\n"
                 + "\n".join(action_results)
                 + "\n\n请继续回答用户的请求。"
             )
-            self.console.print("[muted]继续思考...[/]")
 
-            # 重建 prompt（novel 可能已在 action 中更换）
             system_prompt = self.build_system_prompt()
             user_prompt = self.format_user_prompt(result_text)
 
-            response = await self.llm.chat(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=self.settings.llm_model_writing,
+            response = await self._llm_with_spinner(
+                system_prompt, user_prompt, label="继续思考"
             )
             text, actions = parse_ai_response(response)
 
-            # 将续写结果加入历史
             self.history.append(("user", result_text))
             self.history.append(("assistant", text))
 
-            # 渲染续写回复
             if text.strip():
-                self.console.print("AI>", style="bold cyan", end=" ")
                 render_ai_response(self.console, text)
 
     # ── 动作分发 ──────────────────────────────────────────────────────
@@ -386,6 +439,11 @@ class ChatSession:
     async def execute_action(self, action: dict) -> str:
         """执行 AI 请求的动作，返回结果描述。"""
         name = action.get("action", "")
+        label = _ACTION_LABELS.get(name, name)
+        self.console.print()
+        self.console.print(
+            Text.from_markup(f"[bold cyan]⚡[/bold cyan]  [dim]{label}[/dim]")
+        )
         try:
             if name == "create_novel":
                 return await self._action_create_novel(action)
@@ -910,7 +968,6 @@ class ChatSession:
 
             # 普通对话 — 发送给 AI，AI 可能触发动作并自动继续
             try:
-                self.console.print("[muted]思考中...[/]")
                 await self.send(user_input)
             except KeyboardInterrupt:
                 self.console.print("\n[warning]已中断当前回复[/]")
