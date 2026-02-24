@@ -2,7 +2,7 @@
 
 > 多智能体 AI 网文创作与一键发布系统
 
-![](D:\PyCharm 2025.1.1.1\Projects\小说智能体工作流\asset\framework.png)
+![](./asset/framework.png)
 
 OpenNovel 是一套完全基于 **Claude** 驱动的中文网络小说自动创作框架。多个专职 AI 智能体（规划、写作、编辑、审稿、记忆）通过 **LangGraph** 工作流协同工作，自动完成从选题立意到章节成稿的全流程，并可一键发布到**番茄小说**平台。
 

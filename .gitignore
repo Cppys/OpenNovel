@@ -30,3 +30,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local dev / private docs
+demo.py
+fanqie-api-docs.md
