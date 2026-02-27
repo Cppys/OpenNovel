@@ -89,6 +89,7 @@ class AgentSDKClient:
 
         try:
             result_text = ""
+            _last_assistant_text = ""
             _text_fired = False
             # IMPORTANT: Do NOT return/break early from inside the async for loop.
             # The query() generator uses anyio cancel scopes internally; exiting
@@ -113,11 +114,16 @@ class AgentSDKClient:
                 options=ClaudeAgentOptions(**options_kwargs),
             ):
                 if isinstance(message, ResultMessage):
-                    result_text = message.result or ""
+                    # ResultMessage.result is authoritative when non-empty.
+                    # Don't let an empty result wipe out text we collected
+                    # from AssistantMessages (can happen if max_turns exhausted
+                    # mid-tool-use).
+                    if message.result:
+                        result_text = message.result
                     logger.debug(
                         "AgentSDK result: %d chars, cost=$%s",
                         len(result_text),
-                        message.total_cost_usd,
+                        getattr(message, "total_cost_usd", "?"),
                     )
                     if on_event:
                         on_event({"type": "result"})
@@ -134,10 +140,15 @@ class AgentSDKClient:
                                 if on_event and not _text_fired:
                                     _text_fired = True
                                     on_event({"type": "text", "text": text})
-                                if not result_text:
-                                    result_text += text
+                                # Always keep the latest assistant text as
+                                # fallback in case ResultMessage.result is empty.
+                                _last_assistant_text = text
         except Exception as e:
             raise LLMError(f"Agent SDK query failed: {e}") from e
+
+        # Prefer ResultMessage.result; fall back to last AssistantMessage text
+        if not result_text:
+            result_text = _last_assistant_text
 
         if not result_text:
             logger.warning("AgentSDK returned no content")
@@ -209,23 +220,27 @@ class AgentSDKClient:
 
         try:
             result_text = ""
+            _last_assistant_text = ""
             # Exhaust the generator fully — see chat() comment about cancel scopes.
             async for message in query(
                 prompt=user_prompt,
                 options=ClaudeAgentOptions(**options_kwargs),
             ):
                 if isinstance(message, ResultMessage):
-                    result_text = message.result or ""
+                    if message.result:
+                        result_text = message.result
                 elif isinstance(message, AssistantMessage):
-                    if not result_text:
-                        parts = []
-                        for block in message.content:
-                            if hasattr(block, "text"):
-                                parts.append(block.text)
-                        if parts:
-                            result_text = "".join(parts)
+                    parts = []
+                    for block in message.content:
+                        if hasattr(block, "text") and block.text:
+                            parts.append(block.text)
+                    if parts:
+                        _last_assistant_text = "".join(parts)
         except Exception as e:
             raise LLMError(f"Agent SDK tool query failed: {e}") from e
+
+        if not result_text:
+            result_text = _last_assistant_text
 
         return result_text
 

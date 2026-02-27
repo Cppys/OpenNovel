@@ -350,7 +350,7 @@ $btnInstall.Add_Click({
         # =====================================================================
         # Step 4: Claude Code CLI
         # =====================================================================
-        Set-Progress 28
+        Set-Progress 25
         Write-Log "[4/10] 检测 Claude Code CLI ..."
 
         if (Find-Claude) {
@@ -367,68 +367,10 @@ $btnInstall.Add_Click({
         }
 
         # =====================================================================
-        # Step 4: 复制项目源码
+        # Step 5: 配置 Claude Code settings.json（提前，初始化需要 API Key）
         # =====================================================================
-        Set-Progress 38
-        Write-Log "[5/10] 复制项目文件到 $installDir ..."
-
-        if (-not (Test-Path $installDir)) {
-            New-Item -Path $installDir -ItemType Directory -Force | Out-Null
-        }
-
-        # 使用 robocopy 复制，排除不需要的目录/文件
-        $robocopyArgs = @(
-            "`"$ScriptRoot`""
-            "`"$installDir`""
-            "/E"                        # 递归复制
-            "/NFL"                      # 不列出文件名
-            "/NDL"                      # 不列出目录名
-            "/NJH"                      # 不打印 job header
-            "/NJS"                      # 不打印 job summary
-            "/XD", ".git", ".venv", "data", "__pycache__", "opennovel.egg-info", ".claude"
-            "/XF", "*.pyc", ".env"
-        )
-        $robocopyCmd = "robocopy $($robocopyArgs -join ' ')"
-        cmd /c $robocopyCmd 2>&1 | Out-Null
-        # robocopy 退出码 < 8 表示成功
-        Write-Log "  √ 文件复制完成"
-
-        # =====================================================================
-        # Step 5: 创建虚拟环境 + 安装依赖
-        # =====================================================================
-        Set-Progress 48
-        Write-Log "[6/10] 创建 Python 虚拟环境 ..."
-
-        $venvDir = "$installDir\.venv"
-        if ($pythonCmd -eq "py -3") {
-            & py -3 -m venv $venvDir 2>&1 | ForEach-Object { Write-Log "  $_" }
-        } else {
-            & $pythonCmd -m venv $venvDir 2>&1 | ForEach-Object { Write-Log "  $_" }
-        }
-
-        if (-not (Test-Path "$venvDir\Scripts\pip.exe")) {
-            throw "虚拟环境创建失败。"
-        }
-        Write-Log "  √ 虚拟环境已创建"
-
-        Set-Progress 55
-        Write-Log "  正在安装 Python 依赖（可能需要几分钟）..."
-        & "$venvDir\Scripts\pip.exe" install -e "$installDir" 2>&1 | ForEach-Object { Write-Log "  $_" }
-        Write-Log "  √ Python 依赖安装完成"
-
-        # =====================================================================
-        # Step 6: 安装 Playwright Chromium
-        # =====================================================================
-        Set-Progress 68
-        Write-Log "[7/10] 安装 Playwright Chromium 浏览器 ..."
-        & "$venvDir\Scripts\playwright.exe" install chromium 2>&1 | ForEach-Object { Write-Log "  $_" }
-        Write-Log "  √ Playwright Chromium 安装完成"
-
-        # =====================================================================
-        # Step 7: 配置 Claude Code settings.json
-        # =====================================================================
-        Set-Progress 78
-        Write-Log "[8/10] 配置 Claude Code ..."
+        Set-Progress 32
+        Write-Log "[5/10] 配置 Claude Code ..."
 
         $claudeDir = "$env:USERPROFILE\.claude"
         $settingsPath = "$claudeDir\settings.json"
@@ -437,7 +379,6 @@ $btnInstall.Add_Click({
             try {
                 $settings = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
             } catch {
-                # 文件损坏则备份后新建
                 Copy-Item $settingsPath "$settingsPath.bak" -Force
                 Write-Log "  ! 已有 settings.json 解析失败，已备份为 settings.json.bak"
                 $settings = New-Object PSObject
@@ -470,11 +411,126 @@ $btnInstall.Add_Click({
         Write-Log "  √ Claude Code 配置已写入 $settingsPath"
 
         # =====================================================================
-        # Step 8: 生成 .env 文件
+        # Step 6: 初始化 Claude Code（首次运行需接受服务条款）
         # =====================================================================
-        Set-Progress 84
-        Write-Log "[9/10] 生成 .env 配置文件 ..."
+        Set-Progress 38
+        Write-Log "[6/10] 初始化 Claude Code ..."
 
+        # 先检测是否已初始化（claude --version 能正常执行说明 ToS 已接受）
+        $needInit = $false
+        try {
+            $verOut = & claude --version 2>&1
+            if ($LASTEXITCODE -ne 0) { $needInit = $true }
+        } catch {
+            $needInit = $true
+        }
+
+        if ($needInit) {
+            Write-Log "  Claude Code 需要首次初始化（接受服务条款）"
+            Write-Log "  即将打开终端，请按照提示操作 ..."
+
+            # 生成临时初始化脚本
+            $initBatPath = "$env:TEMP\opennovel_claude_init.bat"
+            $initBatContent = @"
+@echo off
+chcp 65001 >nul
+echo.
+echo  ================================================
+echo    Claude Code 首次初始化
+echo    请按照提示操作（接受服务条款等）
+echo    完成后输入 /exit 退出即可
+echo  ================================================
+echo.
+claude
+echo.
+echo  初始化完成！此窗口将自动关闭 ...
+timeout /t 3 >nul
+"@
+            Set-Content $initBatPath -Value $initBatContent -Encoding ASCII
+            Start-Process cmd -ArgumentList "/c `"$initBatPath`"" -Wait
+            Remove-Item $initBatPath -Force -ErrorAction SilentlyContinue
+            Refresh-Path
+
+            # 验证初始化是否成功
+            try {
+                $verOut2 = & claude --version 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "  √ Claude Code 初始化完成"
+                } else {
+                    Write-Log "  ! 警告：Claude Code 可能未完全初始化，首次运行时可能需要再次设置"
+                }
+            } catch {
+                Write-Log "  ! 警告：Claude Code 可能未完全初始化，首次运行时可能需要再次设置"
+            }
+        } else {
+            Write-Log "  √ Claude Code 已初始化"
+        }
+
+        # =====================================================================
+        # Step 7: 复制项目源码
+        # =====================================================================
+        Set-Progress 45
+        Write-Log "[7/10] 复制项目文件到 $installDir ..."
+
+        if (-not (Test-Path $installDir)) {
+            New-Item -Path $installDir -ItemType Directory -Force | Out-Null
+        }
+
+        # 使用 robocopy 复制，排除不需要的目录/文件
+        $robocopyArgs = @(
+            "`"$ScriptRoot`""
+            "`"$installDir`""
+            "/E"                        # 递归复制
+            "/NFL"                      # 不列出文件名
+            "/NDL"                      # 不列出目录名
+            "/NJH"                      # 不打印 job header
+            "/NJS"                      # 不打印 job summary
+            "/XD", ".git", ".venv", "data", "__pycache__", "opennovel.egg-info", ".claude"
+            "/XF", "*.pyc", ".env"
+        )
+        $robocopyCmd = "robocopy $($robocopyArgs -join ' ')"
+        cmd /c $robocopyCmd 2>&1 | Out-Null
+        # robocopy 退出码 < 8 表示成功
+        Write-Log "  √ 文件复制完成"
+
+        # =====================================================================
+        # Step 8: 创建虚拟环境 + 安装依赖
+        # =====================================================================
+        Set-Progress 55
+        Write-Log "[8/10] 创建 Python 虚拟环境 ..."
+
+        $venvDir = "$installDir\.venv"
+        if ($pythonCmd -eq "py -3") {
+            & py -3 -m venv $venvDir 2>&1 | ForEach-Object { Write-Log "  $_" }
+        } else {
+            & $pythonCmd -m venv $venvDir 2>&1 | ForEach-Object { Write-Log "  $_" }
+        }
+
+        if (-not (Test-Path "$venvDir\Scripts\pip.exe")) {
+            throw "虚拟环境创建失败。"
+        }
+        Write-Log "  √ 虚拟环境已创建"
+
+        Set-Progress 62
+        Write-Log "  正在安装 Python 依赖（可能需要几分钟）..."
+        & "$venvDir\Scripts\pip.exe" install -e "$installDir" 2>&1 | ForEach-Object { Write-Log "  $_" }
+        Write-Log "  √ Python 依赖安装完成"
+
+        # =====================================================================
+        # Step 9: 安装 Playwright Chromium
+        # =====================================================================
+        Set-Progress 72
+        Write-Log "[9/10] 安装 Playwright Chromium 浏览器 ..."
+        & "$venvDir\Scripts\playwright.exe" install chromium 2>&1 | ForEach-Object { Write-Log "  $_" }
+        Write-Log "  √ Playwright Chromium 安装完成"
+
+        # =====================================================================
+        # Step 10: 生成 .env + 启动器 + 快捷方式 + 卸载器
+        # =====================================================================
+        Set-Progress 82
+        Write-Log "[10/10] 生成启动器和快捷方式 ..."
+
+        # --- .env 配置文件 ---
         $envExample = "$installDir\.env.example"
         $envFile    = "$installDir\.env"
         if (Test-Path $envExample) {
@@ -483,12 +539,6 @@ $btnInstall.Add_Click({
         } else {
             Write-Log "  ! .env.example 不存在，跳过"
         }
-
-        # =====================================================================
-        # Step 9: 生成启动器 + 快捷方式 + 卸载器
-        # =====================================================================
-        Set-Progress 90
-        Write-Log "[10/10] 生成启动器和快捷方式 ..."
 
         # --- opennovel.bat ---
         $launcherContent = @"
