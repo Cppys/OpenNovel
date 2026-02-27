@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from agents.base_agent import BaseAgent
 from config.settings import Settings
@@ -34,6 +34,7 @@ class ReviewerAgent(BaseAgent):
         chapter_outline: str,
         context_prompt: str = "",
         char_count: Optional[int] = None,
+        on_event: Optional[Callable[[dict], None]] = None,
     ) -> dict:
         """Review a chapter across multiple quality dimensions.
 
@@ -79,6 +80,7 @@ class ReviewerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=self.settings.llm_model_reviewing,
+                on_event=on_event,
             )
 
             result = parse_json_response(result_text)

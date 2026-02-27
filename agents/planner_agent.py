@@ -183,12 +183,15 @@ class PlannerAgent(BaseAgent):
         chapters_per_volume: int = 30,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> dict:
-        """Generate a complete novel outline by orchestrating 3 sub-agents.
+        """Generate a complete novel outline by orchestrating sub-agents.
 
         Pipeline:
           1. GenreResearchAgent  — analyze genre conventions and reader expectations
           2. StoryArchitectAgent — design characters, world, volumes, plot backbone
-          3. ConflictDesignAgent — design per-chapter conflicts (first volume only)
+
+        Per-chapter outlines are NOT generated here; they are created on-demand
+        when each volume's chapters are about to be written (via ConflictDesignAgent
+        in the load_chapter_context workflow node).
 
         Args:
             genre: Novel genre (e.g., '玄幻', '都市', '言情').
@@ -200,7 +203,7 @@ class PlannerAgent(BaseAgent):
 
         Returns:
             Dict with keys: title, synopsis, genre, style_guide, characters,
-            world_settings, volumes (first volume has chapter outlines),
+            world_settings, volumes (metadata only, no chapter outlines),
             planning_metadata.
         """
         from agents.genre_research_agent import GenreResearchAgent
@@ -213,7 +216,7 @@ class PlannerAgent(BaseAgent):
         if progress_callback:
             progress_callback("genre_research")
 
-        logger.info("Step 1/3: Genre research for '%s'", genre)
+        logger.info("Step 1/2: Genre research for '%s'", genre)
         research_agent = GenreResearchAgent(self.llm, self.settings)
         genre_brief = await research_agent.analyze(genre, premise, ideas)
 
@@ -221,44 +224,22 @@ class PlannerAgent(BaseAgent):
         if progress_callback:
             progress_callback("story_architecture")
 
-        logger.info("Step 2/3: Story architecture for '%s'", premise[:50])
+        logger.info("Step 2/2: Story architecture for '%s'", premise[:50])
         architect_agent = StoryArchitectAgent(self.llm, self.settings)
         architecture = await architect_agent.design(
             genre, premise, ideas, target_chapters, genre_brief,
             chapters_per_volume=chapters_per_volume,
         )
 
-        # Step 3: Conflict & Chapter Design (first volume only)
-        if progress_callback:
-            progress_callback("conflict_design")
-
-        logger.info("Step 3/3: Conflict design for volume 1 (%d chapters)", chapters_per_volume)
-        conflict_agent = ConflictDesignAgent(self.llm, self.settings)
-
-        # Get first volume metadata from architecture
+        # Build volumes list (metadata only, no per-chapter outlines)
         arch_volumes = architecture.get("volumes", [])
-        vol1_title = arch_volumes[0].get("title", "") if arch_volumes else ""
-        vol1_synopsis = arch_volumes[0].get("synopsis", "") if arch_volumes else ""
-
-        vol1_data = await conflict_agent.design_volume(
-            genre=genre,
-            volume_number=1,
-            volume_title=vol1_title,
-            volume_synopsis=vol1_synopsis,
-            chapters_per_volume=chapters_per_volume,
-            chapter_start=1,
-            architecture=architecture,
-            genre_research=genre_brief,
-        )
-
-        # Build volumes list: first volume has chapters, rest have only metadata
         volumes = []
         for i, vol_meta in enumerate(arch_volumes):
             vol_entry = {
                 "volume_number": vol_meta.get("volume_number", i + 1),
                 "title": vol_meta.get("title", ""),
                 "synopsis": vol_meta.get("synopsis", ""),
-                "chapters": vol1_data.get("chapters", []) if i == 0 else [],
+                "chapters": [],
             }
             volumes.append(vol_entry)
 
@@ -302,11 +283,10 @@ class PlannerAgent(BaseAgent):
             progress_callback("complete")
 
         logger.info(
-            "Outline generated: '%s' with %d characters, %d volumes, %d first-volume chapters",
+            "Outline generated: '%s' with %d characters, %d volumes",
             result["title"],
             len(result["characters"]),
             len(result["volumes"]),
-            sum(len(v.get("chapters", [])) for v in result["volumes"]),
         )
 
         return result

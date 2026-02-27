@@ -879,13 +879,18 @@ def setup_browser():
 
 @cli.command()
 @click.option("--novel-id", "-n", required=True, type=int, help="要删除的小说ID")
+@click.option("--volume", "-v", type=int, default=None, help="删除指定卷号（保留小说其他数据）")
+@click.option("--chapter", "-c", type=str, default=None, help="删除指定章节，如 '3' 或 '5-10'")
 @click.option("--force", "-f", is_flag=True, help="跳过确认直接删除")
-def delete(novel_id, force):
-    """删除小说及其所有数据（章节、大纲、角色等）。
+def delete(novel_id, volume, chapter, force):
+    """删除小说、卷或章节数据。
 
     示例：
-      opennovel delete -n 3
-      opennovel delete -n 3 -f
+      opennovel delete -n 3              # 删除整部小说
+      opennovel delete -n 3 -v 2         # 删除第2卷及其章节
+      opennovel delete -n 3 -c 5-10      # 删除第5-10章
+      opennovel delete -n 3 -c 3         # 删除第3章
+      opennovel delete -n 3 -v 1 -f      # 跳过确认
     """
     settings = Settings()
     db = Database(settings.sqlite_db_path)
@@ -895,14 +900,99 @@ def delete(novel_id, force):
         console.print(f"[error]未找到ID为 {novel_id} 的小说[/]")
         sys.exit(1)
 
-    # Show what will be deleted
+    console.print(app_header())
+    console.print()
+
+    # ── Delete specific chapters ──
+    if chapter is not None:
+        from cli.chat import _parse_chapter_range
+        chapter_list = _parse_chapter_range(chapter)
+        if not chapter_list:
+            console.print(f"[error]无效的章节范围: '{chapter}'[/]")
+            sys.exit(1)
+
+        console.print(Panel(
+            f"  [stat.label]小说:[/] [bold]{novel.title}[/] [muted](ID: {novel_id})[/]\n"
+            f"\n"
+            f"  [error]将删除以下章节:[/]\n"
+            f"    第{chapter_list[0]}-{chapter_list[-1]}章"
+            f"（共{len(chapter_list)}章）",
+            title="[error]删除章节[/]",
+            border_style="red",
+            padding=(0, 2),
+        ))
+
+        if not force:
+            confirmed = click.confirm("确认删除？此操作不可撤销", default=False)
+            if not confirmed:
+                console.print("[warning]已取消[/]")
+                return
+
+        deleted = db.delete_chapters(novel_id, chapter_list)
+
+        try:
+            from memory.chroma_store import ChromaStore
+            chroma = ChromaStore(settings.chroma_persist_dir)
+            chroma.delete_chapter_data(novel_id, chapter_list)
+        except Exception as e:
+            console.print(f"[warning]向量记忆清除失败（不影响主数据）: {e}[/]")
+
+        console.print(f"\n[success]已删除 {deleted} 章[/]")
+        return
+
+    # ── Delete specific volume ──
+    if volume is not None:
+        volumes = db.get_volumes(novel_id)
+        vol_obj = next((v for v in volumes if v.volume_number == volume), None)
+        if not vol_obj:
+            console.print(f"[error]未找到第{volume}卷[/]")
+            sys.exit(1)
+
+        # Find chapters in this volume
+        all_chapters = db.get_chapters(novel_id)
+        vol_chapters = [ch for ch in all_chapters if ch.volume_id == vol_obj.id]
+        vol_outlines = [o for o in db.get_outlines(novel_id) if o.volume_id == vol_obj.id]
+
+        console.print(Panel(
+            f"  [stat.label]小说:[/] [bold]{novel.title}[/] [muted](ID: {novel_id})[/]\n"
+            f"  [stat.label]卷:[/] [bold]第{volume}卷 {vol_obj.title}[/]\n"
+            f"\n"
+            f"  [error]将删除以下数据:[/]\n"
+            f"    章节: {len(vol_chapters)}\n"
+            f"    大纲: {len(vol_outlines)}",
+            title="[error]删除卷[/]",
+            border_style="red",
+            padding=(0, 2),
+        ))
+
+        if not force:
+            confirmed = click.confirm("确认删除？此操作不可撤销", default=False)
+            if not confirmed:
+                console.print("[warning]已取消[/]")
+                return
+
+        ch_nums = [ch.chapter_number for ch in vol_chapters]
+        deleted = db.delete_volume(novel_id, volume)
+
+        try:
+            from memory.chroma_store import ChromaStore
+            chroma = ChromaStore(settings.chroma_persist_dir)
+            if ch_nums:
+                chroma.delete_chapter_data(novel_id, ch_nums)
+        except Exception as e:
+            console.print(f"[warning]向量记忆清除失败（不影响主数据）: {e}[/]")
+
+        console.print(
+            f"\n[success]第{volume}卷 '{vol_obj.title}' 已删除（{deleted}章）[/]"
+        )
+        return
+
+    # ── Delete entire novel (original behavior) ──
     chapters = db.get_chapters(novel_id)
     characters = db.get_characters(novel_id)
     outlines = db.get_outlines(novel_id)
     world_settings = db.get_world_settings(novel_id) if hasattr(db, "get_world_settings") else []
 
-    console.print(app_header())
-    console.print()
     console.print(Panel(
         f"  [stat.label]小说:[/] [bold]{novel.title}[/] [muted](ID: {novel_id})[/]\n"
         f"  [stat.label]类型:[/] [genre]{novel.genre}[/]\n"

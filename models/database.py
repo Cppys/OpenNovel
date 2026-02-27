@@ -143,14 +143,22 @@ class Database:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: sqlite3.Connection | None = None
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
+        if self._conn is None:
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute("PRAGMA journal_mode = WAL")
+        return self._conn
+
+    def close(self):
+        """Close the persistent database connection."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def _init_db(self):
         with self._get_conn() as conn:
@@ -243,6 +251,64 @@ class Database:
             conn.execute("DELETE FROM novels WHERE id = ?", (novel_id,))
         logger.info("Novel %d and all associated data deleted", novel_id)
 
+    def delete_volume(self, novel_id: int, volume_number: int) -> int:
+        """Delete a volume and its associated chapters/outlines.
+
+        Returns the number of chapters deleted.
+        """
+        with self._get_conn() as conn:
+            # Find the volume id
+            row = conn.execute(
+                "SELECT id FROM volumes WHERE novel_id = ? AND volume_number = ?",
+                (novel_id, volume_number),
+            ).fetchone()
+            if not row:
+                return 0
+            volume_id = row["id"]
+
+            # Count chapters to report back
+            count_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM chapters WHERE volume_id = ?",
+                (volume_id,),
+            ).fetchone()
+            chapter_count = count_row["cnt"] if count_row else 0
+
+            # Delete related data
+            conn.execute("DELETE FROM outlines WHERE volume_id = ?", (volume_id,))
+            conn.execute("DELETE FROM chapters WHERE volume_id = ?", (volume_id,))
+            conn.execute("DELETE FROM volumes WHERE id = ?", (volume_id,))
+
+        logger.info(
+            "Volume %d of novel %d deleted (%d chapters)",
+            volume_number, novel_id, chapter_count,
+        )
+        return chapter_count
+
+    def delete_chapters(self, novel_id: int, chapter_numbers: list[int]) -> int:
+        """Delete specific chapters and their outlines.
+
+        Returns the number of chapters actually deleted.
+        """
+        if not chapter_numbers:
+            return 0
+        with self._get_conn() as conn:
+            deleted = 0
+            for ch_num in chapter_numbers:
+                cursor = conn.execute(
+                    "DELETE FROM chapters WHERE novel_id = ? AND chapter_number = ?",
+                    (novel_id, ch_num),
+                )
+                deleted += cursor.rowcount
+                conn.execute(
+                    "DELETE FROM outlines WHERE novel_id = ? AND chapter_number = ?",
+                    (novel_id, ch_num),
+                )
+        logger.info(
+            "Deleted %d chapters from novel %d: %s",
+            deleted, novel_id, chapter_numbers,
+        )
+        return deleted
+
     def list_novels(self) -> list[Novel]:
         with self._get_conn() as conn:
             rows = conn.execute("SELECT * FROM novels ORDER BY id").fetchall()
@@ -287,6 +353,14 @@ class Database:
                 )
                 for r in rows
             ]
+
+    def update_volume(self, volume: Volume):
+        """Update a volume's title and synopsis."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE volumes SET title=?, synopsis=? WHERE id=?",
+                (volume.title, volume.synopsis, volume.id),
+            )
 
     # ---- Chapter CRUD ----
 
@@ -550,3 +624,15 @@ class Database:
                 )
                 for r in rows
             ]
+
+    def delete_outline(self, novel_id: int, chapter_number: int) -> bool:
+        """Delete the outline for a specific chapter.
+
+        Returns True if a row was deleted.
+        """
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM outlines WHERE novel_id = ? AND chapter_number = ?",
+                (novel_id, chapter_number),
+            )
+            return cursor.rowcount > 0

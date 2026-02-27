@@ -68,6 +68,9 @@ class NovelWorkflowState(TypedDict, total=False):
     max_revisions: int
     global_review_interval: int
 
+    # Outline generation
+    outline_batch_size: int  # Override default outline batch size (default 5)
+
     # Control flow
     error: str
     should_stop: bool

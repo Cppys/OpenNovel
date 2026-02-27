@@ -197,7 +197,10 @@ class RichProgressCallback:
 
 
 class ChatProgressCallback:
-    """将工作流进度内联输出到聊天界面（不使用 Rich Progress 组件）。"""
+    """将工作流进度内联输出到聊天界面（不使用 Rich Progress 组件）。
+
+    Also updates TUI status bar + node graph when running in TUI mode.
+    """
 
     _NODE_LABELS: dict[str, str] = {
         "initialize": "初始化",
@@ -219,6 +222,20 @@ class ChatProgressCallback:
         "handle_error": "处理错误",
     }
 
+    # When a node exits, show the label of the step that is *entering* next.
+    _ENTERING_LABEL: dict[str, str] = {
+        "plan_novel": "加载章节大纲",
+        "load_chapter_context": "检索记忆上下文",
+        "retrieve_memory": "写作章节草稿",
+        "write_chapter": "编辑与润色",
+        "edit_chapter": "质量审核",
+        "review_chapter": "保存章节",
+        "save_chapter": "更新记忆库",
+        "update_memory": "推进章节",
+        "advance_chapter": "加载章节大纲",
+        "global_review": "推进章节",
+    }
+
     def __init__(self, console=None):
         self._console = console
 
@@ -226,26 +243,49 @@ class ChatProgressCallback:
         if self._console:
             self._console.print(text)
 
+    def _update_status(self, label: str) -> None:
+        """Update TUI status bar if console supports it."""
+        if self._console and hasattr(self._console, "update_status"):
+            self._console.update_status(label)
+
+    def _update_node_graph(self, node: str) -> None:
+        """Update TUI node graph if console supports it."""
+        if self._console and hasattr(self._console, "update_node_graph"):
+            self._console.update_node_graph(node)
+
     def on_node_exit(self, node: str, state: dict) -> None:
         label = self._NODE_LABELS.get(node, node)
-        # Sub-step events show a checkmark for the completed sub-step
+
+        # Sub-step events get printed inline
         if ":" in node:
-            self._print(f"  [green]✓[/] {label}")
-        # Don't log every regular node transition — too noisy
+            self._print(f"  [dim]--[/] [green]{label}[/]")
+            self._update_status(label)
+            self._update_node_graph(node)
+        else:
+            # Regular node: show what is entering next
+            entering_label = self._ENTERING_LABEL.get(node, label)
+            self._update_status(entering_label)
+            self._update_node_graph(node)
 
     def on_chapter_complete(self, chapter_num: int, total: int, char_count: int) -> None:
-        self._print(f"  [green]✓[/] 第{chapter_num}章 ({char_count:,}字)")
+        self._print(f"  [dim]--[/] [green]第{chapter_num}章[/] [dim]({char_count:,}字)[/]")
 
     def on_error(self, node: str, error: str) -> None:
-        self._print(f"  [red]✗ 错误 ({node}): {error}[/]")
+        self._print(f"  [dim]--[/] [red]错误 ({node}): {error}[/]")
 
     def on_workflow_complete(self, final_state: dict) -> None:
         written = final_state.get("chapters_written", 0)
         novel_id = final_state.get("novel_id", 0)
         title = final_state.get("outline_data", {}).get("title", "")
         if written > 0:
-            self._print(f"  [bold green]✓ 写作完成！共 {written} 章[/]")
+            self._print(f"  [bold green]写作完成 -- 共 {written} 章[/]")
         elif title:
-            self._print(f"  [bold green]✓ 大纲生成完成！《{title}》(ID: {novel_id})[/]")
+            self._print(f"  [bold green]大纲生成完成 --[/] {title} [dim](ID: {novel_id})[/]")
         else:
-            self._print(f"  [bold green]✓ 工作流执行完成 (小说ID: {novel_id})[/]")
+            self._print(f"  [bold green]工作流执行完成[/] [dim](小说ID: {novel_id})[/]")
+
+        # Hide node graph when workflow is done
+        if self._console and hasattr(self._console, "hide_node_graph"):
+            self._console.hide_node_graph()
+        if self._console and hasattr(self._console, "clear_status"):
+            self._console.clear_status()

@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from agents.base_agent import BaseAgent
 from config.settings import Settings
@@ -67,6 +67,7 @@ class WriterAgent(BaseAgent):
         emotional_tone: str = "",
         hook_type: str = "cliffhanger",
         target_chapters: int = 0,
+        on_event: Optional[Callable[[dict], None]] = None,
     ) -> dict:
         """Write a single chapter.
 
@@ -123,6 +124,7 @@ class WriterAgent(BaseAgent):
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=self.settings.llm_model_writing,
+            on_event=on_event,
         )
 
         result = _parse_writer_output(raw_text, chapter_number)
@@ -159,6 +161,7 @@ class WriterAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_prompt=expand_prompt,
                 model=self.settings.llm_model_writing,
+                on_event=on_event,
             )
 
             result = _parse_writer_output(raw_text, chapter_number)

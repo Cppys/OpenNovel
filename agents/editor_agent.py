@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from agents.base_agent import BaseAgent
 from config.settings import Settings
@@ -58,6 +58,7 @@ class EditorAgent(BaseAgent):
         chapter_outline: str,
         char_count: int,
         review_issues: Optional[list[dict]] = None,
+        on_event: Optional[Callable[[dict], None]] = None,
     ) -> dict:
         """Edit a chapter for quality and word count compliance.
 
@@ -115,6 +116,7 @@ class EditorAgent(BaseAgent):
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=self.settings.llm_model_editing,
+            on_event=on_event,
         )
 
         result = _parse_editor_output(raw_text, chapter_content)

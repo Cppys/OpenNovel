@@ -9,8 +9,10 @@ import logging
 import re
 from typing import Optional
 
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.live import Live
 from rich.table import Table
@@ -154,7 +156,7 @@ def build_novel_context(db: Database, novel: Novel) -> str:
 
 
 def render_welcome(console, novel: Optional[Novel], db: Optional[Database] = None):
-    """显示 OpenNovel 欢迎界面（Gemini CLI 风格）。"""
+    """显示 OpenNovel 欢迎界面。"""
     # ── 像素字 Banner（深色面板）──
     banner = _build_banner()
     console.print(Panel(
@@ -164,52 +166,22 @@ def render_welcome(console, novel: Optional[Novel], db: Optional[Database] = Non
         padding=(1, 2),
     ))
 
-    # ── 模式 / 小说信息 ──
     if novel and db:
         chapters = db.get_chapters(novel.id)
-        total_chars = sum(ch.char_count for ch in chapters) if chapters else 0
-        console.print(
-            f"\n[bold]{novel.title}[/] [dim]·[/] {novel.genre} [dim]·[/] "
-            f"{len(chapters)}章 [dim]·[/] {total_chars:,}字"
-        )
+        total = sum(ch.char_count for ch in chapters) if chapters else 0
+        console.print(f"\n  [dim]Novel:[/] [bold]{novel.title}[/] "
+                      f"[dim]({novel.genre}, {len(chapters)}章, {total:,}字)[/]")
     else:
-        console.print("\n[dim]通用写作助手模式[/]")
+        console.print("\n  [dim]通用写作助手模式[/]")
+    console.print("  [dim]/help  /clear  /quit[/]")
     console.print()
-
-    # ── 两列：使用方法 + 快捷命令/小说信息 ──
-    left = Text()
-    left.append("使用方法\n", style="bold bright_red")
-    left.append("/help        ", style="cyan")
-    left.append("显示帮助\n", style="dim")
-    left.append("/clear       ", style="cyan")
-    left.append("清空对话历史\n", style="dim")
-    left.append("/quit        ", style="cyan")
-    left.append("退出\n", style="dim")
-
-    right = Text()
-    if novel and db:
-        characters = db.get_characters(novel.id)
-        right.append("提示\n", style="bold bright_red")
-        right.append(f"使用 /novel <id> 绑定小说\n", style="dim")
-        right.append(f"当前: ID {novel.id}  角色 {len(characters)}个\n", style="dim")
-    else:
-        right.append("提示\n", style="bold bright_red")
-        right.append("直接对话，AI 自动执行操作\n", style="dim")
-        right.append('"我想写一个玄幻小说"\n', style="dim")
-        right.append('"写前5章" "给我看看第1章"\n', style="dim")
-
-    table = Table(show_header=False, show_edge=False, box=None, padding=(0, 2))
-    table.add_column(ratio=3)
-    table.add_column(ratio=2)
-    table.add_row(left, right)
-    console.print(table)
+    console.print(Rule(style="dim"))
     console.print()
 
 
 def render_ai_response(console, text: str):
-    """用 Rich Markdown 渲染 AI 回复，带视觉标题。"""
+    """用 Rich Markdown 渲染 AI 回复。"""
     console.print()
-    console.print(Text("◆", style="bold cyan"), end="  ")
     console.print(Markdown(text))
     console.print()
 
@@ -227,7 +199,14 @@ _ACTION_LABELS: dict[str, str] = {
     "switch_novel":     "切换小说",
     "list_novels":      "获取小说列表",
     "delete_novel":     "删除小说",
+    "delete_volume":    "删除卷",
+    "delete_chapters":  "删除章节",
     "publish_chapters": "上传番茄",
+    "regenerate_outline": "重新生成大纲",
+    "rename_novel":     "修改标题",
+    "rename_chapter":   "修改章节标题",
+    "rename_volume":    "修改卷标题",
+    "set_chapter_status": "修改章节状态",
 }
 
 # ── 动作系统提示 ──────────────────────────────────────────────────────────
@@ -238,10 +217,11 @@ _ACTION_SYSTEM_PROMPT = """\
 
 可用动作：
 - create_novel: 创建新小说并生成大纲
-  参数: genre(类型), premise(核心设定), chapters(总章节数,默认30),
+  参数: genre(类型), premise(核心设定), chapters(总章节数,默认100),
         chapters_per_volume(每卷章节数,默认30), ideas(补充想法,可选)
 - write_chapters: 写章节
-  参数: novel_id(小说ID，不填则用当前绑定小说), chapters(如"1-5")
+  参数: novel_id(小说ID，不填则用当前绑定小说), chapters(如"1-5"),
+        outline_count(每批生成大纲数量,默认5,可选)
 - read_chapter: 读取章节正文到对话上下文
   参数: chapter_number(章节号)
 - read_outline: 读取章节大纲到对话上下文
@@ -255,9 +235,23 @@ _ACTION_SYSTEM_PROMPT = """\
 - list_novels: 列出所有小说
 - delete_novel: 删除小说及其所有数据（不可撤销！）
   参数: novel_id(小说ID，不填则删除当前绑定小说)
+- delete_volume: 删除指定卷及其所有章节和大纲（不可撤销！）
+  参数: volume_number(卷号)
+- delete_chapters: 删除指定章节和对应大纲（不可撤销！）
+  参数: chapters(章节范围，如"3"或"5-10")
 - publish_chapters: 将已审核章节上传到番茄小说
   参数: novel_id(可选), chapters(可选，如"1-5"，不填上传所有已审核章节),
         mode("publish"直接发布 或 "draft"保存草稿，默认"publish")
+- regenerate_outline: 重新生成章节大纲（用于跑题/质量不佳时）
+  参数: chapter_number(单个章节号) 或 chapters(范围如"3-5"), outline_count(批次数量,可选)
+- rename_novel: 修改小说标题
+  参数: title(新标题), novel_id(可选，不填则修改当前绑定小说)
+- rename_chapter: 修改章节标题
+  参数: chapter_number(章节号), title(新标题)
+- rename_volume: 修改卷标题
+  参数: volume_number(卷号), title(新标题)
+- set_chapter_status: 修改章节状态
+  参数: chapters(章节范围，如"3"或"5-10"), status(目标状态: planned/drafted/edited/reviewed/published)
 
 规则：
 - 每条回复最多一个动作
@@ -265,13 +259,24 @@ _ACTION_SYSTEM_PROMPT = """\
 - create_novel 执行前必须与用户确认以下参数（用户没说明的需询问，或用括号内默认值）：
   · 小说类型（genre）
   · 核心设定/故事创意（premise）
-  · 总章节数（默认30章）
+  · 总章节数（默认100章）
   · 每卷章节数（默认30章）
   · 补充想法（可选，如特定情节、角色安排等）
 - write_chapters 执行前先确认章节范围
 - delete_novel 是不可逆操作，必须用户明确再次确认后才能执行
+- delete_volume 和 delete_chapters 也是不可逆操作，需用户确认
 - publish_chapters 需要用户事先完成 opennovel setup-browser 登录
 - 动作的JSON必须是合法的JSON格式
+
+文件操作能力：
+除了上述动作，你还拥有 Claude Code 内置的文件读写工具（Read、Write、Edit、Glob、Grep、Bash），
+可以直接操作项目中的任何文件。当用户的需求超出上述动作列表时，直接用文件工具完成。例如：
+- 查看或修改配置文件（.env、config/settings.py）
+- 查看或修改 Agent 的 prompt 模板（config/prompts/*.md）
+- 切换某个 Agent 使用的模型（编辑 .env 中对应的 LLM_MODEL_* 变量）
+- 查看或修改项目源代码
+- 任何其他涉及文件读写的操作
+优先使用动作系统处理小说 CRUD，其余操作直接使用文件工具。
 """
 
 
@@ -333,6 +338,67 @@ class ChatSession:
         parts.append(f"Human: {message}")
         return "\n\n".join(parts)
 
+    # ── 上下文压缩 ──────────────────────────────────────────────────
+
+    async def _compress_history_if_needed(self) -> None:
+        """当对话历史过长时自动压缩为摘要。"""
+        threshold = self.settings.context_compression_threshold
+
+        # Format history to measure length
+        formatted = "\n\n".join(
+            f"{'Human' if role == 'user' else 'Assistant'}: {text}"
+            for role, text in self.history
+        )
+        if len(formatted) <= threshold:
+            return
+
+        total = len(self.history)
+        # Keep at least the most recent 6 entries (3 turns)
+        keep_recent = max(6, int(total * 0.3))
+        split_idx = total - keep_recent
+
+        if split_idx <= 0:
+            return  # Not enough old entries to compress
+
+        old_entries = self.history[:split_idx]
+        recent_entries = self.history[split_idx:]
+
+        # Show compression status
+        is_tui = not isinstance(self.console, Console)
+        if is_tui:
+            self.console.update_status("正在压缩上下文")
+        else:
+            self.console.print("  [dim]正在压缩上下文...[/]")
+
+        try:
+            old_text = "\n\n".join(
+                f"{'Human' if role == 'user' else 'Assistant'}: {text}"
+                for role, text in old_entries
+            )
+            compress_prompt = (
+                "请将以下对话历史压缩为一段约1000字的中文摘要，保留关键信息（小说创作决定、"
+                "角色设定、剧情讨论、用户偏好等），丢弃无关细节和重复内容。"
+                "直接输出摘要内容，不要加前缀或解释。\n\n"
+                f"{old_text}"
+            )
+
+            summary = await self.llm.chat(
+                system_prompt="你是一个对话压缩助手，将长对话精炼为摘要。",
+                user_prompt=compress_prompt,
+                model=self.settings.llm_model_memory,
+            )
+
+            self.history = [("user", f"[上下文摘要] {summary}")] + list(recent_entries)
+            logger.info(
+                "History compressed: %d entries -> %d entries (summary %d chars)",
+                total, len(self.history), len(summary),
+            )
+        except Exception as e:
+            logger.warning("Context compression failed: %s", e)
+        finally:
+            if is_tui:
+                self.console.clear_status()
+
     # ── 消息发送与动作执行 ────────────────────────────────────────────
 
     async def _llm_with_spinner(
@@ -340,21 +406,47 @@ class ChatSession:
         system_prompt: str,
         user_prompt: str,
         label: str = "思考中",
+        max_turns: int = 10,
     ) -> str:
-        """调用 LLM，同时用 Rich Live 显示动画状态指示器。
+        """调用 LLM，同时显示动画状态指示器。
 
-        状态变化：
-          💭 思考中… → ✍️ 回复中… → (done, spinner disappears)
+        Terminal mode: Rich Live spinner.
+        TUI mode: 状态栏 + thinking 内容流式输出到聊天区。
         """
-        _phase: list[str] = [label]   # mutable for closure
+        is_tui = not isinstance(self.console, Console)
+
+        if is_tui:
+            # ── TUI mode: status bar + stream thinking to chat log ──
+            self.console.update_status(label)
+
+            def on_event_tui(event: dict):
+                etype = event.get("type")
+                if etype == "thinking":
+                    self.console.update_status("思考中")
+                    thinking_text = event.get("text", "")
+                    if thinking_text:
+                        self.console.show_thinking(thinking_text)
+                elif etype == "text":
+                    self.console.update_status("生成中")
+
+            try:
+                result = await self.llm.chat(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model=self.settings.llm_model_writing,
+                    max_turns=max_turns,
+                    on_event=on_event_tui,
+                )
+            finally:
+                self.console.clear_status()
+            return result
+
+        # ── Terminal mode: Rich Live spinner ──
+        _phase: list[str] = [label]
         _live_ref: list = [None]
 
         def _make_renderable():
-            if _phase[0] == "回复中":
-                icon, txt = "✍️ ", "回复中"
-            else:
-                icon, txt = "💭 ", _phase[0]
-            return Spinner("dots", text=Text.from_markup(f"  {icon}[dim]{txt}…[/dim]"))
+            return Spinner("dots", text=Text.from_markup(f"  [dim]{_phase[0]}...[/dim]"))
 
         def on_event(event: dict):
             etype = event.get("type")
@@ -363,8 +455,8 @@ class ChatSession:
                 _phase[0] = "思考中"
                 if live:
                     live.update(_make_renderable())
-            elif etype == "text" and _phase[0] != "回复中":
-                _phase[0] = "回复中"
+            elif etype == "text" and _phase[0] != "生成中":
+                _phase[0] = "生成中"
                 if live:
                     live.update(_make_renderable())
 
@@ -379,6 +471,7 @@ class ChatSession:
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=self.settings.llm_model_writing,
+                max_turns=max_turns,
                 on_event=on_event,
             )
 
@@ -390,6 +483,9 @@ class ChatSession:
         渲染工作在此方法内完成，包括首次回复和所有续写回复。
         """
         MAX_AUTO_CONTINUES = 5
+
+        # ── Compress history if too long ──
+        await self._compress_history_if_needed()
 
         # ── 第一次 LLM 调用（带动画状态）──
         system_prompt = self.build_system_prompt()
@@ -409,8 +505,14 @@ class ChatSession:
             if not actions:
                 break
 
+            # Check if cancelled (TUI ESC)
+            if hasattr(self.console, 'cancelled') and self.console.cancelled:
+                break
+
             action_results = []
             for action in actions:
+                if hasattr(self.console, 'cancelled') and self.console.cancelled:
+                    break
                 result = await self.execute_action(action)
                 action_results.append(result)
 
@@ -419,6 +521,9 @@ class ChatSession:
                 + "\n".join(action_results)
                 + "\n\n请继续回答用户的请求。"
             )
+
+            # Compress history between action cycles if needed
+            await self._compress_history_if_needed()
 
             system_prompt = self.build_system_prompt()
             user_prompt = self.format_user_prompt(result_text)
@@ -440,10 +545,19 @@ class ChatSession:
         """执行 AI 请求的动作，返回结果描述。"""
         name = action.get("action", "")
         label = _ACTION_LABELS.get(name, name)
+        params = {k: v for k, v in action.items() if k != "action" and v}
+        param_str = " | ".join(f"{k}: {v}" for k, v in params.items())
+
         self.console.print()
-        self.console.print(
-            Text.from_markup(f"[bold cyan]⚡[/bold cyan]  [dim]{label}[/dim]")
-        )
+        self.console.print(f"  [cyan]{label}[/]")
+        if param_str:
+            self.console.print(f"    [dim]{param_str}[/]")
+
+        # Update TUI status bar during action execution
+        is_tui = not isinstance(self.console, Console)
+        if is_tui:
+            self.console.update_status(f"执行: {label}")
+
         try:
             if name == "create_novel":
                 return await self._action_create_novel(action)
@@ -465,14 +579,31 @@ class ChatSession:
                 return self._action_list_novels()
             elif name == "delete_novel":
                 return self._action_delete_novel(action)
+            elif name == "delete_volume":
+                return self._action_delete_volume(action)
+            elif name == "delete_chapters":
+                return self._action_delete_chapters(action)
             elif name == "publish_chapters":
                 return await self._action_publish_chapters(action)
+            elif name == "regenerate_outline":
+                return await self._action_regenerate_outline(action)
+            elif name == "rename_novel":
+                return self._action_rename_novel(action)
+            elif name == "rename_chapter":
+                return self._action_rename_chapter(action)
+            elif name == "rename_volume":
+                return self._action_rename_volume(action)
+            elif name == "set_chapter_status":
+                return self._action_set_chapter_status(action)
             else:
                 return f"未知动作: {name}"
         except Exception as e:
             logger.exception("Action '%s' failed", name)
-            self.console.print(f"  [red]✗ 动作执行失败: {e}[/]")
+            self.console.print(f"  [red]执行失败: {e}[/]")
             return f"动作 {name} 执行失败: {e}"
+        finally:
+            if is_tui:
+                self.console.clear_status()
 
     # ── 具体动作实现 ──────────────────────────────────────────────────
 
@@ -483,7 +614,7 @@ class ChatSession:
 
         genre = action.get("genre", "")
         premise = action.get("premise", "")
-        chapters = action.get("chapters", 30)
+        chapters = action.get("chapters", 100)
         chapters_per_volume = action.get("chapters_per_volume", 30)
         ideas = action.get("ideas", "")
 
@@ -534,6 +665,7 @@ class ChatSession:
 
         novel_id = action.get("novel_id")
         chapters_str = str(action.get("chapters", ""))
+        outline_count = action.get("outline_count")
 
         # 如果未指定 novel_id，使用当前绑定的小说
         if not novel_id and self.novel:
@@ -562,6 +694,7 @@ class ChatSession:
             novel_id=novel_id,
             genre=novel.genre,
             chapter_list=chapter_list,
+            outline_batch_size=int(outline_count) if outline_count else None,
             callback=cb,
         )
 
@@ -613,8 +746,8 @@ class ChatSession:
         self.history.append(("user", inject_text))
 
         self.console.print(
-            f"  [green]✓[/] 已加载第{chapter_num}章"
-            f"（{chapter.title or '无标题'}，{chapter.char_count}字）"
+            f"  [dim]--[/] [green]已加载第{chapter_num}章"
+            f"（{chapter.title or '无标题'}，{chapter.char_count}字）[/]"
         )
         return (
             f"已加载第{chapter_num}章 "
@@ -644,7 +777,7 @@ class ChatSession:
         inject_text = "\n".join(parts)
         self.history.append(("user", inject_text))
 
-        self.console.print(f"  [green]✓[/] 已加载第{chapter_num}章大纲")
+        self.console.print(f"  [dim]--[/] [green]已加载第{chapter_num}章大纲[/]")
         return f"已加载第{chapter_num}章大纲到对话上下文"
 
     async def _action_edit_chapter(self, action: dict) -> str:
@@ -668,7 +801,7 @@ class ChatSession:
         self.db.update_chapter(chapter)
 
         self.console.print(
-            f"  [green]✓[/] 第{chapter_num}章已更新（{chapter.char_count:,}字）"
+            f"  [dim]--[/] [green]第{chapter_num}章已更新（{chapter.char_count:,}字）[/]"
         )
         return f"第{chapter_num}章已更新（{chapter.char_count:,}字）"
 
@@ -691,7 +824,7 @@ class ChatSession:
             )
 
         result = "\n".join(lines)
-        self.console.print(f"  [green]✓[/] 共{len(chapters)}章")
+        self.console.print(f"  [dim]--[/] [green]共{len(chapters)}章[/]")
         return result
 
     def _action_list_characters(self) -> str:
@@ -712,7 +845,7 @@ class ChatSession:
             lines.append(f"  {c.name}（{role_str}）：{desc}")
 
         result = "\n".join(lines)
-        self.console.print(f"  [green]✓[/] 共{len(characters)}个角色")
+        self.console.print(f"  [dim]--[/] [green]共{len(characters)}个角色[/]")
         return result
 
     def _action_switch_novel(self, action: dict) -> str:
@@ -732,8 +865,8 @@ class ChatSession:
         total_chars = sum(ch.char_count for ch in chapters) if chapters else 0
 
         self.console.print(
-            f"  [green]✓[/] 已切换到《{novel.title}》"
-            f"（{novel.genre} · {len(chapters)}章 · {total_chars:,}字）"
+            f"  [dim]--[/] [green]已切换到《{novel.title}》"
+            f"（{novel.genre} · {len(chapters)}章 · {total_chars:,}字）[/]"
         )
         return (
             f"已切换到《{novel.title}》(ID: {novel.id})\n"
@@ -755,7 +888,7 @@ class ChatSession:
             lines.append(f"  {n.id}. 《{n.title}》({n.genre}){marker}")
 
         result = "\n".join(lines)
-        self.console.print(f"  [green]✓[/] 共{len(novels)}部小说")
+        self.console.print(f"  [dim]--[/] [green]共{len(novels)}部小说[/]")
         return result
 
     def _action_delete_novel(self, action: dict) -> str:
@@ -786,8 +919,351 @@ class ChatSession:
         if self.novel and self.novel.id == int(novel_id):
             self.novel = None
 
-        self.console.print(f"  [green]✓[/] 已删除《{title}》(ID: {novel_id})")
+        self.console.print(f"  [dim]--[/] [green]已删除《{title}》(ID: {novel_id})[/]")
         return f"已删除《{title}》(ID: {novel_id}) 及其所有章节、大纲、角色数据"
+
+    def _action_delete_volume(self, action: dict) -> str:
+        """删除指定卷及其所有章节。"""
+        if not self.novel:
+            return "delete_volume 失败: 未绑定小说"
+
+        volume_number = action.get("volume_number")
+        if volume_number is None:
+            return "delete_volume 失败: 缺少 volume_number 参数"
+
+        volume_number = int(volume_number)
+        volumes = self.db.get_volumes(self.novel.id)
+        vol_obj = next((v for v in volumes if v.volume_number == volume_number), None)
+        if not vol_obj:
+            return f"delete_volume 失败: 未找到第{volume_number}卷"
+
+        # Find chapter numbers in this volume (for chroma cleanup)
+        all_chapters = self.db.get_chapters(self.novel.id)
+        ch_nums = [ch.chapter_number for ch in all_chapters if ch.volume_id == vol_obj.id]
+
+        deleted = self.db.delete_volume(self.novel.id, volume_number)
+
+        try:
+            from memory.chroma_store import ChromaStore
+            chroma = ChromaStore(self.settings.chroma_persist_dir)
+            if ch_nums:
+                chroma.delete_chapter_data(self.novel.id, ch_nums)
+        except Exception as e:
+            logger.warning("Chroma delete failed for volume %d: %s", volume_number, e)
+
+        self.console.print(
+            f"  [dim]--[/] [green]已删除第{volume_number}卷"
+            f" '{vol_obj.title}'（{deleted}章）[/]"
+        )
+        return f"已删除第{volume_number}卷 '{vol_obj.title}'（{deleted}章及对应大纲）"
+
+    def _action_delete_chapters(self, action: dict) -> str:
+        """删除指定章节。"""
+        if not self.novel:
+            return "delete_chapters 失败: 未绑定小说"
+
+        chapters_str = str(action.get("chapters", ""))
+        chapter_list = _parse_chapter_range(chapters_str)
+        if not chapter_list:
+            return f"delete_chapters 失败: 无效的章节范围 '{chapters_str}'"
+
+        deleted = self.db.delete_chapters(self.novel.id, chapter_list)
+
+        try:
+            from memory.chroma_store import ChromaStore
+            chroma = ChromaStore(self.settings.chroma_persist_dir)
+            chroma.delete_chapter_data(self.novel.id, chapter_list)
+        except Exception as e:
+            logger.warning("Chroma delete failed for chapters %s: %s", chapter_list, e)
+
+        self.console.print(
+            f"  [dim]--[/] [green]已删除 {deleted} 章[/]"
+        )
+        return f"已删除 {deleted} 章（第{chapter_list[0]}-{chapter_list[-1]}章）及对应大纲和记忆数据"
+
+    def _action_rename_novel(self, action: dict) -> str:
+        """修改小说标题。"""
+        new_title = action.get("title", "").strip()
+        if not new_title:
+            return "rename_novel 失败: 缺少 title 参数"
+
+        novel_id = action.get("novel_id")
+        if not novel_id and self.novel:
+            novel_id = self.novel.id
+        if not novel_id:
+            return "rename_novel 失败: 未指定 novel_id 且未绑定小说"
+
+        novel = self.db.get_novel(int(novel_id))
+        if not novel:
+            return f"rename_novel 失败: 未找到 ID 为 {novel_id} 的小说"
+
+        old_title = novel.title
+        novel.title = new_title
+        self.db.update_novel(novel)
+
+        # Update bound novel reference if it's the same one
+        if self.novel and self.novel.id == novel.id:
+            self.novel = novel
+
+        self.console.print(
+            f"  [dim]--[/] [green]标题已修改: 《{old_title}》→《{new_title}》[/]"
+        )
+        return f"标题已修改: 《{old_title}》→《{new_title}》(ID: {novel_id})"
+
+    def _action_rename_chapter(self, action: dict) -> str:
+        """修改章节标题。"""
+        if not self.novel:
+            return "rename_chapter 失败: 未绑定小说"
+
+        chapter_number = action.get("chapter_number")
+        new_title = action.get("title", "").strip()
+        if not chapter_number:
+            return "rename_chapter 失败: 缺少 chapter_number 参数"
+        if not new_title:
+            return "rename_chapter 失败: 缺少 title 参数"
+
+        chapter = self.db.get_chapter(self.novel.id, int(chapter_number))
+        if not chapter:
+            return f"rename_chapter 失败: 未找到第{chapter_number}章"
+
+        old_title = chapter.title
+        chapter.title = new_title
+        self.db.update_chapter(chapter)
+
+        self.console.print(
+            f"  [dim]--[/] [green]第{chapter_number}章标题已修改: {old_title} → {new_title}[/]"
+        )
+        return f"第{chapter_number}章标题已修改: {old_title} → {new_title}"
+
+    def _action_rename_volume(self, action: dict) -> str:
+        """修改卷标题。"""
+        if not self.novel:
+            return "rename_volume 失败: 未绑定小说"
+
+        volume_number = action.get("volume_number")
+        new_title = action.get("title", "").strip()
+        if not volume_number:
+            return "rename_volume 失败: 缺少 volume_number 参数"
+        if not new_title:
+            return "rename_volume 失败: 缺少 title 参数"
+
+        volumes = self.db.get_volumes(self.novel.id)
+        target_vol = None
+        for v in volumes:
+            if v.volume_number == int(volume_number):
+                target_vol = v
+                break
+
+        if not target_vol:
+            return f"rename_volume 失败: 未找到第{volume_number}卷"
+
+        old_title = target_vol.title
+        target_vol.title = new_title
+        self.db.update_volume(target_vol)
+
+        self.console.print(
+            f"  [dim]--[/] [green]第{volume_number}卷标题已修改: {old_title} → {new_title}[/]"
+        )
+        return f"第{volume_number}卷标题已修改: {old_title} → {new_title}"
+
+    def _action_set_chapter_status(self, action: dict) -> str:
+        """修改章节状态。"""
+        from models.enums import ChapterStatus
+
+        if not self.novel:
+            return "set_chapter_status 失败: 未绑定小说"
+
+        chapters_str = str(action.get("chapters", ""))
+        status_str = str(action.get("status", "")).strip().lower()
+
+        if not chapters_str:
+            return "set_chapter_status 失败: 缺少 chapters 参数"
+        if not status_str:
+            return "set_chapter_status 失败: 缺少 status 参数"
+
+        # Validate status
+        valid_statuses = {s.value: s for s in ChapterStatus}
+        if status_str not in valid_statuses:
+            return (
+                f"set_chapter_status 失败: 无效状态 '{status_str}'，"
+                f"可选: {', '.join(valid_statuses.keys())}"
+            )
+        target_status = valid_statuses[status_str]
+
+        chapter_list = _parse_chapter_range(chapters_str)
+        if not chapter_list:
+            return f"set_chapter_status 失败: 无效的章节范围 '{chapters_str}'"
+
+        updated = 0
+        for ch_num in chapter_list:
+            chapter = self.db.get_chapter(self.novel.id, ch_num)
+            if chapter:
+                chapter.status = target_status
+                self.db.update_chapter(chapter)
+                updated += 1
+
+        status_labels = {
+            "planned": "已规划", "drafted": "草稿",
+            "edited": "已编辑", "reviewed": "已审核",
+            "published": "已发布",
+        }
+        label = status_labels.get(status_str, status_str)
+        self.console.print(
+            f"  [dim]--[/] [green]{updated} 章状态已改为「{label}」[/]"
+        )
+        return f"已将 {updated} 章状态修改为 {label}"
+
+    async def _action_regenerate_outline(self, action: dict) -> str:
+        """重新生成章节大纲。"""
+        import json as _json
+        from agents.conflict_design_agent import ConflictDesignAgent
+        from memory.chroma_store import ChromaStore
+
+        if not self.novel:
+            return "regenerate_outline 失败: 未绑定小说"
+
+        novel = self.novel
+        novel_id = novel.id
+
+        # Parse target chapters
+        chapter_num = action.get("chapter_number")
+        chapters_str = str(action.get("chapters", ""))
+        outline_count = action.get("outline_count")
+
+        if chapter_num is not None:
+            target_chapters = [int(chapter_num)]
+        elif chapters_str:
+            target_chapters = _parse_chapter_range(chapters_str)
+        else:
+            return "regenerate_outline 失败: 需要 chapter_number 或 chapters 参数"
+
+        if not target_chapters:
+            return "regenerate_outline 失败: 无效的章节范围"
+
+        self.console.print(f"  [dim]重新生成第{target_chapters[0]}-{target_chapters[-1]}章大纲...[/]")
+
+        # Delete old outlines
+        for ch_num in target_chapters:
+            self.db.delete_outline(novel_id, ch_num)
+
+        # Load planning metadata
+        if not novel.planning_metadata:
+            return "regenerate_outline 失败: 小说缺少规划元数据，无法生成大纲"
+
+        try:
+            meta = _json.loads(novel.planning_metadata)
+        except _json.JSONDecodeError:
+            return "regenerate_outline 失败: 规划元数据格式错误"
+
+        cpv = novel.chapters_per_volume or 30
+        ch_start = target_chapters[0]
+        vol_num = (ch_start - 1) // cpv + 1
+        batch_count = outline_count if outline_count else len(target_chapters)
+
+        # Find volume metadata
+        vol_meta_list = meta.get("volumes", [])
+        vol_meta = None
+        for vm in vol_meta_list:
+            if vm.get("volume_number") == vol_num:
+                vol_meta = vm
+                break
+        if not vol_meta:
+            vol_meta = {"title": f"第{vol_num}卷", "synopsis": ""}
+
+        # Build architecture dict
+        characters = self.db.get_characters(novel_id)
+        world_settings = self.db.get_world_settings(novel_id)
+        architecture = {
+            "title": novel.title,
+            "synopsis": novel.synopsis,
+            "style_guide": novel.style_guide,
+            "characters": [
+                {"name": c.name, "role": c.role.value, "description": c.description,
+                 "background": c.background, "abilities": c.abilities, "arc": ""}
+                for c in characters
+            ],
+            "world_settings": [
+                {"category": ws.category, "name": ws.name, "description": ws.description}
+                for ws in world_settings
+            ],
+            "volumes": vol_meta_list,
+            "plot_backbone": meta.get("plot_backbone", ""),
+        }
+
+        # Get written chapter summaries for continuity
+        try:
+            chroma = ChromaStore(self.settings.chroma_persist_dir)
+            recent_summaries = chroma.get_recent_summaries(novel_id, ch_start, count=10)
+            summary_lines = [
+                f"第{s['chapter_number']}章：{s['summary']}"
+                for s in recent_summaries
+            ]
+            previously_written = "\n".join(summary_lines) if summary_lines else ""
+        except Exception:
+            previously_written = ""
+
+        # Ensure volume record exists
+        volumes = self.db.get_volumes(novel_id)
+        vol_id = None
+        for v in volumes:
+            if v.volume_number == vol_num:
+                vol_id = v.id
+                break
+        if vol_id is None:
+            from models.novel import Volume
+            vol_id = self.db.create_volume(Volume(
+                novel_id=novel_id,
+                volume_number=vol_num,
+                title=vol_meta.get("title", f"第{vol_num}卷"),
+                synopsis=vol_meta.get("synopsis", ""),
+                target_chapters=cpv,
+            ))
+
+        # Generate new outlines
+        conflict_agent = ConflictDesignAgent(
+            llm_client=self.llm, settings=self.settings,
+        )
+        try:
+            vol_data = await conflict_agent.design_volume(
+                genre=novel.genre,
+                volume_number=vol_num,
+                volume_title=vol_meta.get("title", ""),
+                volume_synopsis=vol_meta.get("synopsis", ""),
+                chapters_per_volume=int(batch_count),
+                chapter_start=ch_start,
+                architecture=architecture,
+                genre_research=meta.get("genre_brief", {}),
+                previously_written_summaries=previously_written,
+            )
+        except Exception as e:
+            return f"regenerate_outline 失败: 大纲生成出错 ({e})"
+
+        # Persist new outlines
+        from models.chapter import Outline
+        saved = 0
+        for ch_data in vol_data.get("chapters", []):
+            ch_num = ch_data.get("chapter_number", 0)
+            if ch_num == 0 or ch_num not in target_chapters:
+                continue
+            # Make sure old one is gone (double-check)
+            self.db.delete_outline(novel_id, ch_num)
+            new_outline = Outline(
+                novel_id=novel_id,
+                volume_id=vol_id,
+                chapter_number=ch_num,
+                outline_text=ch_data.get("outline", ""),
+                key_scenes=_json.dumps(ch_data.get("key_scenes", []), ensure_ascii=False),
+                characters_involved=_json.dumps(
+                    ch_data.get("characters_involved", []), ensure_ascii=False
+                ),
+                emotional_tone=ch_data.get("emotional_tone", ""),
+                hook_type=ch_data.get("hook_type", "cliffhanger"),
+            )
+            self.db.create_outline(new_outline)
+            saved += 1
+
+        self.console.print(f"  [dim]--[/] [green]已重新生成 {saved} 章大纲[/]")
+        return f"已重新生成 {saved} 章大纲（第{target_chapters[0]}-{target_chapters[-1]}章）"
 
     async def _action_publish_chapters(self, action: dict) -> str:
         """将已审核章节上传到番茄小说。"""
@@ -839,7 +1315,7 @@ class ChatSession:
                 if book_id:
                     novel.fanqie_book_id = book_id
                     self.db.update_novel(novel)
-                    self.console.print(f"  [green]✓[/] 番茄建书成功 (book_id: {book_id})")
+                    self.console.print(f"  [dim]--[/] [green]番茄建书成功 (book_id: {book_id})[/]")
                 else:
                     return "publish_chapters 失败: 自动建书返回空 book_id，请先运行 opennovel setup-browser 登录"
             except Exception as e:
@@ -867,13 +1343,13 @@ class ChatSession:
                 ch.fanqie_chapter_id = result.get("item_id", "")
                 self.db.update_chapter(ch)
                 self.console.print(
-                    f"  [green]✓[/] 第{ch.chapter_number}章 "
-                    f"{'已发布' if mode == 'publish' else '草稿已保存'}"
+                    f"  [dim]--[/] [green]第{ch.chapter_number}章 "
+                    f"{'已发布' if mode == 'publish' else '草稿已保存'}[/]"
                 )
             else:
                 self.console.print(
-                    f"  [red]✗[/] 第{ch.chapter_number}章失败: "
-                    f"{result.get('message', '未知错误')}"
+                    f"  [dim]--[/] [red]第{ch.chapter_number}章失败: "
+                    f"{result.get('message', '未知错误')}[/]"
                 )
 
         return f"上传完成：成功 {success_count}/{len(reviewed)} 章"
@@ -898,23 +1374,16 @@ class ChatSession:
         return f"[error]未知命令: {command}[/]\n输入 /help 查看可用命令"
 
     def _cmd_help(self) -> str:
-        lines = [
-            "[bold]快捷命令[/]",
+        return "\n".join([
+            "[bold]Commands[/]",
             "",
-            "  [accent]/help[/]    显示本帮助",
-            "  [accent]/quit[/]    退出对话",
-            "  [accent]/clear[/]   清空对话历史",
+            "  [cyan]/help[/]    显示帮助",
+            "  [cyan]/quit[/]    退出",
+            "  [cyan]/clear[/]   清空对话历史",
             "",
-            "[bold]AI 代理模式[/]",
-            "",
-            "  直接用自然语言告诉 AI 你想做什么，AI 会自动执行操作：",
-            "  · \"我想写一个玄幻小说\"    → AI 确认设定后创建大纲",
-            "  · \"写前5章\"              → AI 调用工作流写章节",
-            "  · \"给我看看第1章\"         → AI 加载章节内容",
-            "  · \"帮我改一下第3章的开头\"  → AI 读取并修改章节",
-            "  · \"列出所有角色\"          → AI 查询角色列表",
-        ]
-        return "\n".join(lines)
+            '[dim]直接对话，AI 自动执行操作。[/]',
+            '[dim]  "我想写一个玄幻小说"  "写前5章"  "给我看看第1章"[/]',
+        ])
 
     def _cmd_clear(self) -> str:
         self.history.clear()
@@ -929,29 +1398,15 @@ class ChatSession:
         # ── 状态栏 ──
         model = self.settings.llm_model_writing
         path = f"~/opennovel/{self.novel.id}" if self.novel else "~/opennovel"
-        status = Table(show_header=False, show_edge=False, box=None, expand=True, padding=0)
-        status.add_column(ratio=1)
-        status.add_column(ratio=1, justify="center")
-        status.add_column(ratio=1, justify="right")
-        status.add_row(
-            f"[dim]{path}[/]",
-            "[dim]chat-mode[/]",
-            f"[dim]{model}[/]",
-        )
-        self.console.print(status)
+        self.console.print(f"[dim]{path}  chat  {model}[/]")
         self.console.print()
 
         while True:
-            # ── 边框输入框 ──
-            w = max(self.console.size.width - 2, 20)
-            self.console.print(f"[dim]╭{'─' * (w - 2)}╮[/]")
             try:
-                user_input = self.console.input("[dim]│[/] [bright_blue]>[/] ").strip()
+                user_input = self.console.input("[bright_blue]>[/] ").strip()
             except (EOFError, KeyboardInterrupt):
-                self.console.print(f"[dim]╰{'─' * (w - 2)}╯[/]")
-                self.console.print("\n[muted]再见！[/]")
+                self.console.print("\n[dim]再见[/]")
                 break
-            self.console.print(f"[dim]╰{'─' * (w - 2)}╯[/]")
 
             if not user_input:
                 continue
@@ -960,7 +1415,7 @@ class ChatSession:
             if user_input.startswith("/"):
                 result = self.handle_command(user_input)
                 if result is None:
-                    self.console.print("[muted]再见！[/]")
+                    self.console.print("[dim]再见[/]")
                     break
                 self.console.print(result)
                 self.console.print()

@@ -1,5 +1,6 @@
 """LangGraph StateGraph: orchestrates the multi-agent novel workflow."""
 
+import asyncio
 import json
 import logging
 import math
@@ -8,7 +9,7 @@ from typing import Optional
 from langgraph.graph import StateGraph, END
 
 from config.exceptions import LLMError, LLMTimeoutError, WorkflowError
-from config.settings import Settings
+from config.settings import Settings, get_settings
 from memory.chroma_store import ChromaStore
 from models.database import Database
 from models.novel import Novel, Volume
@@ -45,6 +46,84 @@ _MAX_NODE_RETRIES = 2
 _active_callback = None
 
 
+def _make_thinking_forwarder(node_label: str):
+    """Create an on_event callback that forwards thinking to the TUI console.
+
+    The callback is passed to agent LLM calls so that extended thinking
+    content appears in the TUI chat log during workflow execution.
+    """
+    cb = _active_callback
+    if cb is None:
+        return None
+
+    console = getattr(cb, "_console", None)
+    if console is None or not hasattr(console, "show_thinking"):
+        return None
+
+    def _on_event(event: dict):
+        etype = event.get("type")
+        if etype == "thinking":
+            text = event.get("text", "")
+            if text:
+                console.show_thinking(text)
+        elif etype == "text":
+            console.update_status(f"{node_label} · 生成中")
+
+    return _on_event
+
+
+# ---------------------------------------------------------------------------
+# Shared resource management — created once per run_workflow() call
+# ---------------------------------------------------------------------------
+
+class _WorkflowResources:
+    """Lazily-initialized, shared resources for all workflow nodes."""
+
+    def __init__(self):
+        self._settings = None
+        self._db = None
+        self._chroma = None
+        self._llm = None
+
+    @property
+    def settings(self):
+        if self._settings is None:
+            self._settings = get_settings()
+        return self._settings
+
+    @property
+    def db(self):
+        if self._db is None:
+            self._db = Database(self.settings.sqlite_db_path)
+        return self._db
+
+    @property
+    def chroma(self):
+        if self._chroma is None:
+            self._chroma = ChromaStore(self.settings.chroma_persist_dir)
+        return self._chroma
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            self._llm = AgentSDKClient(self.settings)
+        return self._llm
+
+    def close(self):
+        if self._db is not None:
+            self._db.close()
+
+
+_resources: _WorkflowResources | None = None
+
+
+def _get_resources() -> _WorkflowResources:
+    global _resources
+    if _resources is None:
+        _resources = _WorkflowResources()
+    return _resources
+
+
 # ---------------------------------------------------------------------------
 # Node functions (all async for Agent SDK compatibility)
 # ---------------------------------------------------------------------------
@@ -52,7 +131,7 @@ _active_callback = None
 async def initialize(state: NovelWorkflowState) -> dict:
     """Initialize shared resources and validate inputs."""
     logger.info("Entering node: initialize")
-    settings = Settings()
+    r = _get_resources()
     mode = state.get("mode", "continue")
     novel_id = state.get("novel_id", 0)
 
@@ -60,16 +139,14 @@ async def initialize(state: NovelWorkflowState) -> dict:
 
     # Base config from settings
     base_updates = {
-        "max_revisions": settings.max_revisions,
-        "global_review_interval": settings.global_review_interval,
+        "max_revisions": r.settings.max_revisions,
+        "global_review_interval": r.settings.global_review_interval,
         "retry_count": 0,
         "last_node": "initialize",
     }
 
-    db = Database(settings.sqlite_db_path)
-
     if mode == "continue":
-        novel = db.get_novel(novel_id)
+        novel = r.db.get_novel(novel_id)
         if not novel:
             return {**base_updates, "error": f"Novel {novel_id} not found"}
 
@@ -88,12 +165,12 @@ async def initialize(state: NovelWorkflowState) -> dict:
                 "chapter_list_index": 0,
                 "chapters_written": 0,
                 "revision_count": 0,
-                "publish_mode": state.get("publish_mode", settings.default_publish_mode),
+                "publish_mode": state.get("publish_mode", r.settings.default_publish_mode),
                 "should_stop": False,
                 "error": "",
             }
 
-        last_ch = db.get_last_chapter_number(novel_id)
+        last_ch = r.db.get_last_chapter_number(novel_id)
         target = state.get("target_chapters", 0)
         actual_target = last_ch + target if target > 0 else 0
 
@@ -106,7 +183,7 @@ async def initialize(state: NovelWorkflowState) -> dict:
             "target_chapters": actual_target,
             "chapters_written": 0,
             "revision_count": 0,
-            "publish_mode": state.get("publish_mode", settings.default_publish_mode),
+            "publish_mode": state.get("publish_mode", r.settings.default_publish_mode),
             "should_stop": False,
             "error": "",
         }
@@ -128,7 +205,7 @@ async def initialize(state: NovelWorkflowState) -> dict:
             "target_chapters": state.get("target_chapters", 10),
             "chapters_written": 0,
             "revision_count": 0,
-            "publish_mode": state.get("publish_mode", settings.default_publish_mode),
+            "publish_mode": state.get("publish_mode", r.settings.default_publish_mode),
             "should_stop": False,
             "error": "",
         }
@@ -160,9 +237,8 @@ async def initialize(state: NovelWorkflowState) -> dict:
 async def plan_novel(state: NovelWorkflowState) -> dict:
     """Generate novel outline, characters, world settings (new novel only)."""
     logger.info("Entering node: plan_novel")
-    settings = Settings()
-    llm = AgentSDKClient(settings)
-    planner = PlannerAgent(llm_client=llm, settings=settings)
+    r = _get_resources()
+    planner = PlannerAgent(llm_client=r.llm, settings=r.settings)
 
     genre = state.get("genre", "玄幻")
     premise = state.get("premise", "")
@@ -196,7 +272,6 @@ async def plan_novel(state: NovelWorkflowState) -> dict:
         outline_data["title"] = premise
 
     # Persist novel to database
-    db = Database(settings.sqlite_db_path)
 
     # Serialize planning_metadata for on-demand outline generation
     planning_meta_json = None
@@ -214,7 +289,7 @@ async def plan_novel(state: NovelWorkflowState) -> dict:
         planning_metadata=planning_meta_json,
         status=NovelStatus.WRITING,
     )
-    novel_id = db.create_novel(novel)
+    novel_id = r.db.create_novel(novel)
     logger.info("Novel created: id=%d, title=%s", novel_id, novel.title)
 
     # Persist volumes and chapter outlines
@@ -226,7 +301,7 @@ async def plan_novel(state: NovelWorkflowState) -> dict:
             synopsis=vol_data.get("synopsis", ""),
             target_chapters=len(vol_data.get("chapters", [])),
         )
-        vol_id = db.create_volume(volume)
+        vol_id = r.db.create_volume(volume)
 
         for ch_data in vol_data.get("chapters", []):
             ch_num = ch_data.get("chapter_number", 0)
@@ -244,7 +319,7 @@ async def plan_novel(state: NovelWorkflowState) -> dict:
                 emotional_tone=ch_data.get("emotional_tone", ""),
                 hook_type=ch_data.get("hook_type", "cliffhanger"),
             )
-            db.create_outline(outline)
+            r.db.create_outline(outline)
 
     # Persist characters
     for char_data in outline_data.get("characters", []):
@@ -262,10 +337,9 @@ async def plan_novel(state: NovelWorkflowState) -> dict:
             abilities=char_data.get("abilities", ""),
             first_appearance=char_data.get("first_appearance", 1),
         )
-        db.create_character(character)
+        r.db.create_character(character)
 
     # Persist world settings
-    chroma = ChromaStore(settings.chroma_persist_dir)
     for ws_data in outline_data.get("world_settings", []):
         ws = WorldSetting(
             novel_id=novel_id,
@@ -273,8 +347,8 @@ async def plan_novel(state: NovelWorkflowState) -> dict:
             name=ws_data.get("name", ""),
             description=ws_data.get("description", ""),
         )
-        db.create_world_setting(ws)
-        chroma.add_world_event(
+        r.db.create_world_setting(ws)
+        r.chroma.add_world_event(
             novel_id=novel_id,
             chapter_number=0,
             event_description=f"[{ws.category}] {ws.name}: {ws.description}",
@@ -288,20 +362,25 @@ async def plan_novel(state: NovelWorkflowState) -> dict:
     }
 
 
+# Maximum chapters to generate outlines for in a single LLM call.
+# Larger values slow down the call and risk incomplete output.
+_OUTLINE_BATCH_SIZE = 5
+
+
 async def load_chapter_context(state: NovelWorkflowState) -> dict:
     """Load the current chapter's outline from the database.
 
     If no outline exists for the current chapter, triggers on-demand outline
-    generation for the entire volume that chapter belongs to.
+    generation in batches of _OUTLINE_BATCH_SIZE chapters until the current
+    chapter's outline is available (or all batches in the volume are exhausted).
     """
     logger.info("Entering node: load_chapter_context")
-    settings = Settings()
-    db = Database(settings.sqlite_db_path)
+    r = _get_resources()
 
     novel_id = state["novel_id"]
     current_ch = state["current_chapter"]
 
-    outline = db.get_outline(novel_id, current_ch)
+    outline = r.db.get_outline(novel_id, current_ch)
     if outline:
         return {
             "chapter_outline": outline.outline_text,
@@ -311,20 +390,20 @@ async def load_chapter_context(state: NovelWorkflowState) -> dict:
             "last_node": "load_chapter_context",
         }
 
-    # No outline found — try on-demand generation for this volume
-    novel = db.get_novel(novel_id)
+    # No outline found — try on-demand generation
+    novel = r.db.get_novel(novel_id)
     if novel and novel.planning_metadata:
-        logger.info("No outline for chapter %d, generating volume outlines on-demand", current_ch)
+        logger.info("No outline for chapter %d, generating outlines on-demand", current_ch)
 
-        # Emit progress event
-        if _active_callback is not None:
-            _active_callback.on_node_exit("load_chapter_context:generating_outlines", state)
+        # Allow state to override the default batch size
+        batch_size = state.get("outline_batch_size") or _OUTLINE_BATCH_SIZE
 
         try:
             meta = json.loads(novel.planning_metadata)
             cpv = novel.chapters_per_volume or 30
             vol_num = (current_ch - 1) // cpv + 1
-            chapter_start = (vol_num - 1) * cpv + 1
+            vol_start = (vol_num - 1) * cpv + 1
+            vol_end = vol_start + cpv - 1
 
             # Find volume metadata
             vol_meta_list = meta.get("volumes", [])
@@ -337,6 +416,7 @@ async def load_chapter_context(state: NovelWorkflowState) -> dict:
                 vol_meta = {"title": f"第{vol_num}卷", "synopsis": ""}
 
             # Build architecture dict from metadata
+            characters = r.db.get_characters(novel_id)
             architecture = {
                 "title": novel.title,
                 "synopsis": novel.synopsis,
@@ -344,50 +424,25 @@ async def load_chapter_context(state: NovelWorkflowState) -> dict:
                 "characters": [
                     {"name": c.name, "role": c.role.value, "description": c.description,
                      "background": c.background, "abilities": c.abilities, "arc": ""}
-                    for c in db.get_characters(novel_id)
+                    for c in characters
                 ],
                 "world_settings": [
                     {"category": ws.category, "name": ws.name, "description": ws.description}
-                    for ws in db.get_world_settings(novel_id)
+                    for ws in r.db.get_world_settings(novel_id)
                 ],
                 "volumes": vol_meta_list,
                 "plot_backbone": meta.get("plot_backbone", ""),
             }
 
-            # Gather previously written chapter summaries for continuity
-            chroma = ChromaStore(settings.chroma_persist_dir)
-            recent_summaries = chroma.get_recent_summaries(novel_id, chapter_start, count=10)
-            summary_lines = []
-            for s in recent_summaries:
-                summary_lines.append(f"第{s['chapter_number']}章：{s['summary']}")
-            previously_written = "\n".join(summary_lines) if summary_lines else ""
-
-            # Generate outlines for this volume
-            from agents.conflict_design_agent import ConflictDesignAgent
-            llm = AgentSDKClient(settings)
-            conflict_agent = ConflictDesignAgent(llm_client=llm, settings=settings)
-
-            vol_data = await conflict_agent.design_volume(
-                genre=novel.genre,
-                volume_number=vol_num,
-                volume_title=vol_meta.get("title", ""),
-                volume_synopsis=vol_meta.get("synopsis", ""),
-                chapters_per_volume=cpv,
-                chapter_start=chapter_start,
-                architecture=architecture,
-                genre_research=meta.get("genre_brief", {}),
-                previously_written_summaries=previously_written,
-            )
-
             # Ensure volume record exists
-            volumes = db.get_volumes(novel_id)
+            volumes = r.db.get_volumes(novel_id)
             vol_id = None
             for v in volumes:
                 if v.volume_number == vol_num:
                     vol_id = v.id
                     break
             if vol_id is None:
-                vol_id = db.create_volume(Volume(
+                vol_id = r.db.create_volume(Volume(
                     novel_id=novel_id,
                     volume_number=vol_num,
                     title=vol_meta.get("title", f"第{vol_num}卷"),
@@ -395,32 +450,102 @@ async def load_chapter_context(state: NovelWorkflowState) -> dict:
                     target_chapters=cpv,
                 ))
 
-            # Persist outlines
-            for ch_data in vol_data.get("chapters", []):
-                ch_num = ch_data.get("chapter_number", 0)
-                if ch_num == 0:
-                    continue
-                existing_outline = db.get_outline(novel_id, ch_num)
-                if existing_outline:
-                    continue
-                new_outline = Outline(
-                    novel_id=novel_id,
-                    volume_id=vol_id,
-                    chapter_number=ch_num,
-                    outline_text=ch_data.get("outline", ""),
-                    key_scenes=json.dumps(ch_data.get("key_scenes", []), ensure_ascii=False),
-                    characters_involved=json.dumps(
-                        ch_data.get("characters_involved", []), ensure_ascii=False
-                    ),
-                    emotional_tone=ch_data.get("emotional_tone", ""),
-                    hook_type=ch_data.get("hook_type", "cliffhanger"),
-                )
-                db.create_outline(new_outline)
+            # Generate outlines in batches of batch_size
+            from agents.conflict_design_agent import ConflictDesignAgent
+            conflict_agent = ConflictDesignAgent(llm_client=r.llm, settings=r.settings)
 
-            logger.info("Generated %d outlines for volume %d", len(vol_data.get("chapters", [])), vol_num)
+            batch_start = current_ch  # Start from the chapter we actually need
+            while batch_start <= vol_end:
+                batch_end = min(batch_start + batch_size - 1, vol_end)
+                batch_count = batch_end - batch_start + 1
+
+                # Skip this batch if all its outlines already exist
+                has_missing = any(
+                    r.db.get_outline(novel_id, ch) is None
+                    for ch in range(batch_start, batch_end + 1)
+                )
+                if not has_missing:
+                    batch_start = batch_end + 1
+                    continue
+
+                # Emit progress event
+                if _active_callback is not None:
+                    _active_callback.on_node_exit(
+                        f"load_chapter_context:generating_outlines_{batch_start}_{batch_end}",
+                        state,
+                    )
+
+                logger.info(
+                    "Generating outlines batch: chapter %d-%d (%d chapters)",
+                    batch_start, batch_end, batch_count,
+                )
+
+                # Gather previously written chapter summaries for continuity
+                recent_summaries = r.chroma.get_recent_summaries(
+                    novel_id, batch_start, count=10
+                )
+                summary_lines = [
+                    f"第{s['chapter_number']}章：{s['summary']}"
+                    for s in recent_summaries
+                ]
+                previously_written = "\n".join(summary_lines) if summary_lines else ""
+
+                try:
+                    vol_data = await conflict_agent.design_volume(
+                        genre=novel.genre,
+                        volume_number=vol_num,
+                        volume_title=vol_meta.get("title", ""),
+                        volume_synopsis=vol_meta.get("synopsis", ""),
+                        chapters_per_volume=batch_count,
+                        chapter_start=batch_start,
+                        architecture=architecture,
+                        genre_research=meta.get("genre_brief", {}),
+                        previously_written_summaries=previously_written,
+                    )
+
+                    # Persist outlines
+                    saved = 0
+                    for ch_data in vol_data.get("chapters", []):
+                        ch_num = ch_data.get("chapter_number", 0)
+                        if ch_num == 0:
+                            continue
+                        if r.db.get_outline(novel_id, ch_num):
+                            continue
+                        new_outline = Outline(
+                            novel_id=novel_id,
+                            volume_id=vol_id,
+                            chapter_number=ch_num,
+                            outline_text=ch_data.get("outline", ""),
+                            key_scenes=json.dumps(
+                                ch_data.get("key_scenes", []), ensure_ascii=False
+                            ),
+                            characters_involved=json.dumps(
+                                ch_data.get("characters_involved", []), ensure_ascii=False
+                            ),
+                            emotional_tone=ch_data.get("emotional_tone", ""),
+                            hook_type=ch_data.get("hook_type", "cliffhanger"),
+                        )
+                        r.db.create_outline(new_outline)
+                        saved += 1
+
+                    logger.info(
+                        "Batch %d-%d: generated %d outlines, saved %d new",
+                        batch_start, batch_end, len(vol_data.get("chapters", [])), saved,
+                    )
+                except Exception as e:
+                    logger.warning("Outline batch %d-%d failed: %s", batch_start, batch_end, e)
+
+                # After the first batch (which covers current_ch), check if we got
+                # the outline we need. If so, stop generating further batches —
+                # they'll be generated on-demand when those chapters are reached.
+                outline = r.db.get_outline(novel_id, current_ch)
+                if outline:
+                    break
+
+                batch_start = batch_end + 1
 
             # Re-fetch the outline for current chapter
-            outline = db.get_outline(novel_id, current_ch)
+            outline = r.db.get_outline(novel_id, current_ch)
             if outline:
                 return {
                     "chapter_outline": outline.outline_text,
@@ -433,9 +558,26 @@ async def load_chapter_context(state: NovelWorkflowState) -> dict:
         except Exception as e:
             logger.warning("On-demand outline generation failed: %s", e)
 
-    logger.warning("No outline for chapter %d, using placeholder", current_ch)
+    # Fallback: build an informative placeholder using available data
+    logger.warning("No outline for chapter %d, building context-based placeholder", current_ch)
+    placeholder_parts = [f"第{current_ch}章：推进主线剧情。"]
+    try:
+        characters = r.db.get_characters(novel_id)
+        if characters:
+            active_chars = [c for c in characters if c.status.value == "active"]
+            main_chars = [c for c in active_chars if c.role.value in ("protagonist", "antagonist")]
+            if main_chars:
+                char_info = "、".join(f"{c.name}（{c.description[:30]}）" for c in main_chars[:4])
+                placeholder_parts.append(f"核心角色：{char_info}")
+        events = r.db.get_unresolved_events(novel_id)
+        if events:
+            event_descs = "；".join(e.description[:40] for e in events[:3])
+            placeholder_parts.append(f"待推进伏笔：{event_descs}")
+    except Exception:
+        pass
+
     return {
-        "chapter_outline": f"第{current_ch}章：继续推进主线剧情",
+        "chapter_outline": "\n".join(placeholder_parts),
         "emotional_tone": "",
         "hook_type": "cliffhanger",
         "revision_count": 0,
@@ -446,20 +588,22 @@ async def load_chapter_context(state: NovelWorkflowState) -> dict:
 async def retrieve_memory(state: NovelWorkflowState) -> dict:
     """Assemble memory context for the writer."""
     logger.info("Entering node: retrieve_memory")
-    settings = Settings()
-    db = Database(settings.sqlite_db_path)
-    chroma = ChromaStore(settings.chroma_persist_dir)
+    r = _get_resources()
 
     novel_id = state["novel_id"]
     current_ch = state["current_chapter"]
     chapter_outline = state.get("chapter_outline", "")
 
-    llm = AgentSDKClient(settings)
-    memory_mgr = MemoryManagerAgent(db=db, chroma=chroma, llm_client=llm, settings=settings)
+    memory_mgr = MemoryManagerAgent(db=r.db, chroma=r.chroma, llm_client=r.llm, settings=r.settings)
 
     try:
-        context = memory_mgr.retrieve_context(novel_id, current_ch, chapter_outline)
-        previous_ending = memory_mgr.get_previous_ending(novel_id, current_ch)
+        context_coro = memory_mgr.retriever.assemble_context_async(
+            novel_id, current_ch, chapter_outline
+        )
+        ending_coro = asyncio.to_thread(
+            memory_mgr.get_previous_ending, novel_id, current_ch
+        )
+        context, previous_ending = await asyncio.gather(context_coro, ending_coro)
     except Exception as e:
         logger.warning("Memory retrieval failed, using empty context: %s", e)
         context = ""
@@ -475,9 +619,8 @@ async def retrieve_memory(state: NovelWorkflowState) -> dict:
 async def write_chapter(state: NovelWorkflowState) -> dict:
     """Generate chapter draft using the Writer agent."""
     logger.info("Entering node: write_chapter")
-    settings = Settings()
-    llm = AgentSDKClient(settings)
-    writer = WriterAgent(llm_client=llm, settings=settings)
+    r = _get_resources()
+    writer = WriterAgent(llm_client=r.llm, settings=r.settings)
 
     try:
         result = await writer.write_chapter(
@@ -490,6 +633,7 @@ async def write_chapter(state: NovelWorkflowState) -> dict:
             emotional_tone=state.get("emotional_tone", ""),
             hook_type=state.get("hook_type", "cliffhanger"),
             target_chapters=state.get("target_chapters", 0),
+            on_event=_make_thinking_forwarder("写作"),
         )
     except LLMError as e:
         return {"error": str(e), "last_node": "write_chapter"}
@@ -505,9 +649,8 @@ async def write_chapter(state: NovelWorkflowState) -> dict:
 async def edit_chapter(state: NovelWorkflowState) -> dict:
     """Polish chapter and adjust word count via Editor agent."""
     logger.info("Entering node: edit_chapter")
-    settings = Settings()
-    llm = AgentSDKClient(settings)
-    editor = EditorAgent(llm_client=llm, settings=settings)
+    r = _get_resources()
+    editor = EditorAgent(llm_client=r.llm, settings=r.settings)
 
     # Use review issues if this is a re-edit after failed review
     review_issues = None
@@ -529,6 +672,7 @@ async def edit_chapter(state: NovelWorkflowState) -> dict:
             chapter_outline=state.get("chapter_outline", ""),
             char_count=char_count,
             review_issues=review_issues,
+            on_event=_make_thinking_forwarder("编辑"),
         )
     except LLMError as e:
         return {"error": str(e), "last_node": "edit_chapter"}
@@ -544,9 +688,8 @@ async def edit_chapter(state: NovelWorkflowState) -> dict:
 async def review_chapter(state: NovelWorkflowState) -> dict:
     """Multi-dimensional quality review via Reviewer agent."""
     logger.info("Entering node: review_chapter")
-    settings = Settings()
-    llm = AgentSDKClient(settings)
-    reviewer = ReviewerAgent(llm_client=llm, settings=settings)
+    r = _get_resources()
+    reviewer = ReviewerAgent(llm_client=r.llm, settings=r.settings)
 
     try:
         result = await reviewer.review_chapter(
@@ -554,6 +697,7 @@ async def review_chapter(state: NovelWorkflowState) -> dict:
             chapter_outline=state.get("chapter_outline", ""),
             context_prompt=state.get("context_prompt", ""),
             char_count=state.get("edited_char_count"),
+            on_event=_make_thinking_forwarder("审核"),
         )
     except LLMError as e:
         # If review fails, force pass to avoid blocking
@@ -561,7 +705,7 @@ async def review_chapter(state: NovelWorkflowState) -> dict:
         result = {"passed": True, "score": 0.0, "summary": f"[审核跳过] LLM调用失败: {e}"}
 
     revision_count = state.get("revision_count", 0) + 1
-    max_revisions = state.get("max_revisions", settings.max_revisions)
+    max_revisions = state.get("max_revisions", r.settings.max_revisions)
     passed = result.get("passed", False)
 
     if not passed and revision_count >= max_revisions:
@@ -585,14 +729,13 @@ async def review_chapter(state: NovelWorkflowState) -> dict:
 async def save_chapter(state: NovelWorkflowState) -> dict:
     """Persist the reviewed chapter to the database."""
     logger.info("Entering node: save_chapter")
-    settings = Settings()
-    db = Database(settings.sqlite_db_path)
+    r = _get_resources()
 
     novel_id = state["novel_id"]
     current_ch = state["current_chapter"]
     review = state.get("review_result", {})
 
-    existing = db.get_chapter(novel_id, current_ch)
+    existing = r.db.get_chapter(novel_id, current_ch)
     if existing:
         existing.title = state.get("draft_title", f"第{current_ch}章")
         existing.content = state.get("edited_content", "")
@@ -601,7 +744,7 @@ async def save_chapter(state: NovelWorkflowState) -> dict:
         existing.review_score = review.get("score")
         existing.review_notes = review.get("summary", "")
         existing.revision_count = state.get("revision_count", 0)
-        db.update_chapter(existing)
+        r.db.update_chapter(existing)
     else:
         chapter = Chapter(
             novel_id=novel_id,
@@ -615,7 +758,7 @@ async def save_chapter(state: NovelWorkflowState) -> dict:
             review_notes=review.get("summary", ""),
             revision_count=state.get("revision_count", 0),
         )
-        db.create_chapter(chapter)
+        r.db.create_chapter(chapter)
 
     logger.info(
         "Chapter %d saved: %d chars, score=%.1f",
@@ -628,12 +771,9 @@ async def save_chapter(state: NovelWorkflowState) -> dict:
 async def update_memory(state: NovelWorkflowState) -> dict:
     """Update memory stores after chapter is saved."""
     logger.info("Entering node: update_memory")
-    settings = Settings()
-    db = Database(settings.sqlite_db_path)
-    chroma = ChromaStore(settings.chroma_persist_dir)
-    llm = AgentSDKClient(settings)
+    r = _get_resources()
 
-    memory_mgr = MemoryManagerAgent(db=db, chroma=chroma, llm_client=llm, settings=settings)
+    memory_mgr = MemoryManagerAgent(db=r.db, chroma=r.chroma, llm_client=r.llm, settings=r.settings)
 
     novel_id = state["novel_id"]
     current_ch = state["current_chapter"]
@@ -652,12 +792,9 @@ async def update_memory(state: NovelWorkflowState) -> dict:
 async def global_review(state: NovelWorkflowState) -> dict:
     """Periodic global consistency review (every N chapters)."""
     logger.info("Entering node: global_review")
-    settings = Settings()
-    db = Database(settings.sqlite_db_path)
-    chroma = ChromaStore(settings.chroma_persist_dir)
-    llm = AgentSDKClient(settings)
+    r = _get_resources()
 
-    memory_mgr = MemoryManagerAgent(db=db, chroma=chroma, llm_client=llm, settings=settings)
+    memory_mgr = MemoryManagerAgent(db=r.db, chroma=r.chroma, llm_client=r.llm, settings=r.settings)
 
     try:
         review_data = await memory_mgr.global_review(state["novel_id"])
@@ -844,6 +981,7 @@ async def run_workflow(
     chapters_per_volume: int = 30,
     chapter_list: Optional[list[int]] = None,
     publish_mode: str = "draft",
+    outline_batch_size: Optional[int] = None,
     checkpointer=None,
     thread_id: Optional[str] = None,
     callback=None,
@@ -860,6 +998,7 @@ async def run_workflow(
         chapters_per_volume: Chapters per volume (for "new"/"plan_only" mode).
         chapter_list: Specific chapter numbers to write (for "continue" mode).
         publish_mode: "draft", "publish", or "pre-publish".
+        outline_batch_size: Override default outline batch size (default 5).
         checkpointer: Optional LangGraph checkpointer for persistence.
         thread_id: Optional thread ID for checkpoint resume.
         callback: Optional WorkflowCallback for progress reporting.
@@ -884,6 +1023,9 @@ async def run_workflow(
         initial_state["chapter_list"] = chapter_list
         initial_state["chapter_list_index"] = 0
 
+    if outline_batch_size is not None:
+        initial_state["outline_batch_size"] = outline_batch_size
+
     logger.info("Starting workflow: mode=%s, genre=%s, chapters=%d", mode, genre, target_chapters)
 
     # Calculate recursion limit based on number of chapters.
@@ -895,15 +1037,21 @@ async def run_workflow(
     if thread_id:
         config["configurable"] = {"thread_id": thread_id}
 
-    if callback is not None:
-        global _active_callback
-        _active_callback = callback
-        try:
-            final_state = await _run_with_callback(app, initial_state, config or None, callback)
-        finally:
-            _active_callback = None
-    else:
-        final_state = await app.ainvoke(initial_state, config=config or None)
+    global _resources
+    _resources = _WorkflowResources()
+    try:
+        if callback is not None:
+            global _active_callback
+            _active_callback = callback
+            try:
+                final_state = await _run_with_callback(app, initial_state, config or None, callback)
+            finally:
+                _active_callback = None
+        else:
+            final_state = await app.ainvoke(initial_state, config=config or None)
+    finally:
+        _resources.close()
+        _resources = None
 
     logger.info("Workflow completed")
     return final_state

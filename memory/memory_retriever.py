@@ -1,5 +1,6 @@
 """Memory retrieval and context assembly for chapter writing."""
 
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -73,13 +74,13 @@ class MemoryRetriever:
         # 3. Active character states
         characters = self.db.get_characters(novel_id)
         if characters:
+            all_states = self.chroma.get_all_character_states(novel_id)
             lines = ["【主要角色状态】"]
             for char in characters:
                 if char.status.value != "active":
                     continue
-                # Get latest state from ChromaDB
-                state = self.chroma.get_latest_character_state(novel_id, char.name)
-                state_text = state["state"] if state else "初始状态"
+                state_entry = all_states.get(char.name)
+                state_text = state_entry["state"] if state_entry else "初始状态"
                 role_label = {"protagonist": "主角", "antagonist": "反派",
                               "supporting": "配角", "minor": "路人"}.get(char.role.value, "")
                 lines.append(f"- {char.name}（{role_label}）：{char.description[:100]}。当前：{state_text[:100]}")
@@ -155,11 +156,92 @@ class MemoryRetriever:
             ch for ch in all_chapters
             if ch.chapter_number < current_chapter_number and ch.content
         ]
-        if earlier:
-            prev = max(earlier, key=lambda ch: ch.chapter_number)
-            content = prev.content
-            if len(content) <= char_limit:
-                return content
-            return content[-char_limit:]
-
         return ""
+
+    async def assemble_context_async(
+        self,
+        novel_id: int,
+        current_chapter_number: int,
+        chapter_outline: str,
+    ) -> str:
+        """Async version of assemble_context with concurrent I/O.
+
+        Fetches independent data sources in parallel using asyncio.gather,
+        then assembles the context string identically to the sync version.
+        """
+        # Phase 1: fetch independent data sources concurrently
+        recent_fut = asyncio.to_thread(
+            self.chroma.get_recent_summaries, novel_id, current_chapter_number, 3
+        )
+        chars_fut = asyncio.to_thread(self.db.get_characters, novel_id)
+        all_states_fut = asyncio.to_thread(self.chroma.get_all_character_states, novel_id)
+        events_fut = asyncio.to_thread(self.db.get_unresolved_events, novel_id)
+        world_fut = asyncio.to_thread(self.db.get_world_settings, novel_id)
+
+        recent, characters, all_states, events, world_settings = await asyncio.gather(
+            recent_fut, chars_fut, all_states_fut, events_fut, world_fut
+        )
+
+        sections = []
+
+        # 1. Recent chapter summaries
+        if recent:
+            lines = ["【近期章节回顾】"]
+            for item in recent:
+                lines.append(f"第{item['chapter_number']}章：{item['summary']}")
+            sections.append("\n".join(lines))
+
+        # 2. Semantically relevant earlier summaries (depends on recent)
+        exclude_chapters = [item["chapter_number"] for item in recent]
+        exclude_chapters.append(current_chapter_number)
+
+        relevant = await asyncio.to_thread(
+            self.chroma.search_relevant_summaries,
+            novel_id, chapter_outline, exclude_chapters, 7,
+        )
+        if relevant:
+            lines = ["【相关前文回顾】"]
+            relevant.sort(key=lambda x: x["chapter_number"])
+            for item in relevant:
+                lines.append(f"第{item['chapter_number']}章：{item['summary']}")
+            sections.append("\n".join(lines))
+
+        # 3. Active character states
+        if characters:
+            lines = ["【主要角色状态】"]
+            for char in characters:
+                if char.status.value != "active":
+                    continue
+                state_entry = all_states.get(char.name)
+                state_text = state_entry["state"] if state_entry else "初始状态"
+                role_label = {"protagonist": "主角", "antagonist": "反派",
+                              "supporting": "配角", "minor": "路人"}.get(char.role.value, "")
+                lines.append(f"- {char.name}（{role_label}）：{char.description[:100]}。当前：{state_text[:100]}")
+            sections.append("\n".join(lines))
+
+        # 4. Unresolved plot threads
+        if events:
+            lines = ["【未解决的伏笔/悬念】"]
+            for event in events:
+                importance_label = {"critical": "关键", "major": "重要",
+                                    "normal": "普通", "minor": "次要"}.get(event.importance.value, "")
+                lines.append(
+                    f"- [{importance_label}] {event.description}（第{event.chapter_number}章埋下）"
+                )
+            sections.append("\n".join(lines))
+
+        # 5. Relevant world settings
+        if world_settings:
+            lines = ["【世界观设定】"]
+            for ws in world_settings[:10]:
+                lines.append(f"- {ws.name}：{ws.description[:80]}")
+            sections.append("\n".join(lines))
+
+        # Combine and trim to context limit
+        full_context = "\n\n".join(sections)
+
+        max_chars = self.settings.context_max_chars
+        if len(full_context) > max_chars:
+            full_context = self._trim_context(sections, max_chars)
+
+        return full_context

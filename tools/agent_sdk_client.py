@@ -94,13 +94,16 @@ class AgentSDKClient:
             # The query() generator uses anyio cancel scopes internally; exiting
             # the loop prematurely causes "Attempted to exit cancel scope in a
             # different task" errors. We must exhaust the generator fully.
+            options_kwargs = {
+                "system_prompt": system_prompt,
+                "model": model,
+                "max_turns": max_turns,
+            }
+            if max_turns and max_turns > 1:
+                options_kwargs["permission_mode"] = "bypassPermissions"
             async for message in query(
                 prompt=user_prompt,
-                options=ClaudeAgentOptions(
-                    system_prompt=system_prompt,
-                    model=model,
-                    max_turns=max_turns,
-                ),
+                options=ClaudeAgentOptions(**options_kwargs),
             ):
                 if isinstance(message, ResultMessage):
                     result_text = message.result or ""

@@ -85,28 +85,28 @@ class MemoryManagerAgent(BaseAgent):
                 )
 
         # Process new characters
-        for new_char in summary_data.get("new_characters", []):
-            name = new_char.get("name", "")
-            if not name:
-                continue
-            # Check if character already exists
-            existing = self.db.get_characters(novel_id)
-            if any(c.name == name for c in existing):
-                continue
-            role_str = new_char.get("role", "minor")
-            try:
-                role = CharacterRole(role_str)
-            except ValueError:
-                role = CharacterRole.MINOR
-            character = Character(
-                novel_id=novel_id,
-                name=name,
-                role=role,
-                description=new_char.get("description", ""),
-                first_appearance=chapter_number,
-            )
-            self.db.create_character(character)
-            logger.info(f"New character discovered: {name}")
+        new_characters_list = summary_data.get("new_characters", [])
+        if new_characters_list:
+            existing_names = {c.name for c in self.db.get_characters(novel_id)}
+            for new_char in new_characters_list:
+                name = new_char.get("name", "")
+                if not name or name in existing_names:
+                    continue
+                role_str = new_char.get("role", "minor")
+                try:
+                    role = CharacterRole(role_str)
+                except ValueError:
+                    role = CharacterRole.MINOR
+                character = Character(
+                    novel_id=novel_id,
+                    name=name,
+                    role=role,
+                    description=new_char.get("description", ""),
+                    first_appearance=chapter_number,
+                )
+                self.db.create_character(character)
+                existing_names.add(name)
+                logger.info(f"New character discovered: {name}")
 
         # Process plot events
         for event_data in summary_data.get("plot_events", []):

@@ -119,6 +119,44 @@ class TestCharacterStates:
         assert result_a["state"] == "小说A中的王五"
         assert result_b["state"] == "小说B中的王五"
 
+    def test_get_all_character_states(self, chroma_store):
+        # Add states for multiple characters at different chapters
+        chroma_store.add_character_state(
+            novel_id=1, character_name="张三", chapter_number=1, state_description="张三第1章状态"
+        )
+        chroma_store.add_character_state(
+            novel_id=1, character_name="张三", chapter_number=5, state_description="张三第5章状态"
+        )
+        chroma_store.add_character_state(
+            novel_id=1, character_name="李四", chapter_number=3, state_description="李四第3章状态"
+        )
+
+        result = chroma_store.get_all_character_states(novel_id=1)
+        assert len(result) == 2
+        assert result["张三"]["state"] == "张三第5章状态"
+        assert result["张三"]["chapter_number"] == 5
+        assert result["李四"]["state"] == "李四第3章状态"
+        assert result["李四"]["chapter_number"] == 3
+
+    def test_get_all_character_states_empty(self, chroma_store):
+        result = chroma_store.get_all_character_states(novel_id=9999)
+        assert result == {}
+
+    def test_get_all_character_states_isolated_by_novel(self, chroma_store):
+        chroma_store.add_character_state(
+            novel_id=30, character_name="赵六", chapter_number=1, state_description="小说A赵六"
+        )
+        chroma_store.add_character_state(
+            novel_id=31, character_name="赵六", chapter_number=1, state_description="小说B赵六"
+        )
+
+        result_a = chroma_store.get_all_character_states(novel_id=30)
+        result_b = chroma_store.get_all_character_states(novel_id=31)
+        assert len(result_a) == 1
+        assert result_a["赵六"]["state"] == "小说A赵六"
+        assert len(result_b) == 1
+        assert result_b["赵六"]["state"] == "小说B赵六"
+
 
 class TestWorldEvents:
     def test_add_multiple_events_without_id_collision(self, chroma_store):

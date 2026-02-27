@@ -65,19 +65,23 @@ class ChromaStore:
         self, novel_id: int, current_chapter: int, count: int = 3
     ) -> list[dict]:
         """Get the most recent chapter summaries by exact chapter number."""
+        chapter_range = range(max(1, current_chapter - count), current_chapter)
+        if not chapter_range:
+            return []
+        doc_ids = [f"novel_{novel_id}_ch_{ch}" for ch in chapter_range]
+        try:
+            result = self.summaries.get(ids=doc_ids, include=["documents", "metadatas"])
+        except Exception:
+            return []
         results = []
-        for ch_num in range(max(1, current_chapter - count), current_chapter):
-            doc_id = f"novel_{novel_id}_ch_{ch_num}"
-            try:
-                result = self.summaries.get(ids=[doc_id], include=["documents", "metadatas"])
-                if result["documents"]:
-                    results.append({
-                        "chapter_number": ch_num,
-                        "summary": result["documents"][0],
-                        "metadata": result["metadatas"][0],
-                    })
-            except Exception:
-                continue
+        if result["documents"]:
+            for doc, meta in zip(result["documents"], result["metadatas"]):
+                results.append({
+                    "chapter_number": meta.get("chapter_number", 0),
+                    "summary": doc,
+                    "metadata": meta,
+                })
+        results.sort(key=lambda x: x["chapter_number"])
         return results
 
     def search_relevant_summaries(
@@ -193,6 +197,26 @@ class ChromaStore:
                 }
         return best
 
+    def get_all_character_states(self, novel_id: int) -> dict[str, dict]:
+        """Get all character states for a novel, returning the latest state per character.
+
+        Returns:
+            Dict mapping character_name -> {"character_name": ..., "chapter_number": ..., "state": ...}
+        """
+        results = self.characters.get(
+            where={"novel_id": novel_id},
+            include=["documents", "metadatas"],
+        )
+        if not results["documents"]:
+            return {}
+        latest: dict[str, dict] = {}
+        for doc, meta in zip(results["documents"], results["metadatas"]):
+            name = meta.get("character_name", "")
+            ch = meta.get("chapter_number", 0)
+            if name not in latest or ch > latest[name]["chapter_number"]:
+                latest[name] = {"character_name": name, "chapter_number": ch, "state": doc}
+        return latest
+
     # ---- World Events ----
 
     def add_world_event(
@@ -235,3 +259,28 @@ class ChromaStore:
             )
             if results["ids"]:
                 collection.delete(ids=results["ids"])
+
+    def delete_chapter_data(self, novel_id: int, chapter_numbers: list[int]):
+        """Delete data for specific chapters from all collections."""
+        for ch_num in chapter_numbers:
+            # Summary: deterministic ID
+            summary_id = f"novel_{novel_id}_ch_{ch_num}"
+            try:
+                self.summaries.delete(ids=[summary_id])
+            except Exception:
+                pass
+
+            # Characters & events: filter by metadata
+            for collection in [self.characters, self.events]:
+                try:
+                    results = collection.get(
+                        where={"$and": [
+                            {"novel_id": novel_id},
+                            {"chapter_number": ch_num},
+                        ]},
+                        include=[],
+                    )
+                    if results["ids"]:
+                        collection.delete(ids=results["ids"])
+                except Exception:
+                    pass
