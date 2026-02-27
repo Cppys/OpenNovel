@@ -71,6 +71,14 @@ function Find-Node {
     return $false
 }
 
+function Find-Git {
+    try {
+        $ver = & git --version 2>&1
+        if ($ver -match "git version") { return $true }
+    } catch {}
+    return $false
+}
+
 function Find-Claude {
     try {
         $ver = & claude --version 2>&1
@@ -216,7 +224,7 @@ $btnInstall.Add_Click({
         # Step 1: Python
         # =====================================================================
         Set-Progress 5
-        Write-Log "[1/9] 检测 Python ..."
+        Write-Log "[1/10] 检测 Python ..."
         $pythonCmd = Find-Python
 
         if ($pythonCmd) {
@@ -261,7 +269,7 @@ $btnInstall.Add_Click({
         # Step 2: Node.js
         # =====================================================================
         Set-Progress 15
-        Write-Log "[2/9] 检测 Node.js ..."
+        Write-Log "[2/10] 检测 Node.js ..."
 
         if (Find-Node) {
             Write-Log "  √ 已找到 Node.js"
@@ -299,10 +307,51 @@ $btnInstall.Add_Click({
         }
 
         # =====================================================================
-        # Step 3: Claude Code CLI
+        # Step 3: Git (Claude Code CLI 强制依赖 Git Bash)
         # =====================================================================
-        Set-Progress 25
-        Write-Log "[3/9] 检测 Claude Code CLI ..."
+        Set-Progress 22
+        Write-Log "[3/10] 检测 Git ..."
+
+        if (Find-Git) {
+            Write-Log "  √ 已找到 Git"
+        } else {
+            Write-Log "  未检测到 Git，正在安装（Claude Code 需要 Git Bash）..."
+            $installed = $false
+
+            # 尝试 winget
+            try {
+                $wingetVer = & winget --version 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "  使用 winget 安装 ..."
+                    & winget install Git.Git --silent --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Log "  $_" }
+                    Refresh-Path
+                    if (Find-Git) { $installed = $true }
+                }
+            } catch {}
+
+            # 回退：直接下载安装
+            if (-not $installed) {
+                Write-Log "  winget 不可用，正在下载 Git 安装包 ..."
+                $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.2/Git-2.47.1.2-64-bit.exe"
+                $gitInstaller = "$env:TEMP\Git-installer.exe"
+                (New-Object System.Net.WebClient).DownloadFile($gitUrl, $gitInstaller)
+                Write-Log "  下载完成，正在静默安装 ..."
+                Start-Process -FilePath $gitInstaller -ArgumentList "/VERYSILENT /NORESTART /NOCANCEL /SP- /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS" -Wait
+                Remove-Item $gitInstaller -Force -ErrorAction SilentlyContinue
+                Refresh-Path
+            }
+
+            if (-not (Find-Git)) {
+                throw "Git 安装失败，请手动安装 Git (https://git-scm.com/downloads/win) 后重试。"
+            }
+            Write-Log "  √ Git 安装完成"
+        }
+
+        # =====================================================================
+        # Step 4: Claude Code CLI
+        # =====================================================================
+        Set-Progress 28
+        Write-Log "[4/10] 检测 Claude Code CLI ..."
 
         if (Find-Claude) {
             Write-Log "  √ 已找到 Claude Code CLI"
@@ -320,8 +369,8 @@ $btnInstall.Add_Click({
         # =====================================================================
         # Step 4: 复制项目源码
         # =====================================================================
-        Set-Progress 35
-        Write-Log "[4/9] 复制项目文件到 $installDir ..."
+        Set-Progress 38
+        Write-Log "[5/10] 复制项目文件到 $installDir ..."
 
         if (-not (Test-Path $installDir)) {
             New-Item -Path $installDir -ItemType Directory -Force | Out-Null
@@ -347,8 +396,8 @@ $btnInstall.Add_Click({
         # =====================================================================
         # Step 5: 创建虚拟环境 + 安装依赖
         # =====================================================================
-        Set-Progress 45
-        Write-Log "[5/9] 创建 Python 虚拟环境 ..."
+        Set-Progress 48
+        Write-Log "[6/10] 创建 Python 虚拟环境 ..."
 
         $venvDir = "$installDir\.venv"
         if ($pythonCmd -eq "py -3") {
@@ -370,16 +419,16 @@ $btnInstall.Add_Click({
         # =====================================================================
         # Step 6: 安装 Playwright Chromium
         # =====================================================================
-        Set-Progress 70
-        Write-Log "[6/9] 安装 Playwright Chromium 浏览器 ..."
+        Set-Progress 68
+        Write-Log "[7/10] 安装 Playwright Chromium 浏览器 ..."
         & "$venvDir\Scripts\playwright.exe" install chromium 2>&1 | ForEach-Object { Write-Log "  $_" }
         Write-Log "  √ Playwright Chromium 安装完成"
 
         # =====================================================================
         # Step 7: 配置 Claude Code settings.json
         # =====================================================================
-        Set-Progress 80
-        Write-Log "[7/9] 配置 Claude Code ..."
+        Set-Progress 78
+        Write-Log "[8/10] 配置 Claude Code ..."
 
         $claudeDir = "$env:USERPROFILE\.claude"
         $settingsPath = "$claudeDir\settings.json"
@@ -423,8 +472,8 @@ $btnInstall.Add_Click({
         # =====================================================================
         # Step 8: 生成 .env 文件
         # =====================================================================
-        Set-Progress 85
-        Write-Log "[8/9] 生成 .env 配置文件 ..."
+        Set-Progress 84
+        Write-Log "[9/10] 生成 .env 配置文件 ..."
 
         $envExample = "$installDir\.env.example"
         $envFile    = "$installDir\.env"
@@ -439,7 +488,7 @@ $btnInstall.Add_Click({
         # Step 9: 生成启动器 + 快捷方式 + 卸载器
         # =====================================================================
         Set-Progress 90
-        Write-Log "[9/9] 生成启动器和快捷方式 ..."
+        Write-Log "[10/10] 生成启动器和快捷方式 ..."
 
         # --- opennovel.bat ---
         $launcherContent = @"
@@ -450,6 +499,18 @@ cd /d "%~dp0"
 "@
         Set-Content "$installDir\opennovel.bat" -Value $launcherContent -Encoding ASCII
         Write-Log "  √ 启动器 opennovel.bat 已生成"
+
+        # --- setup-browser.bat（番茄小说登录）---
+        $setupBrowserContent = @"
+@echo off
+chcp 65001 >nul
+cd /d "%~dp0"
+echo 正在启动浏览器，请扫码登录番茄小说作家后台...
+.venv\Scripts\python.exe -m cli.main setup-browser
+pause
+"@
+        Set-Content "$installDir\setup-browser.bat" -Value $setupBrowserContent -Encoding ASCII
+        Write-Log "  √ 番茄登录器 setup-browser.bat 已生成"
 
         # --- 桌面快捷方式 ---
         $desktopPath = [Environment]::GetFolderPath("Desktop")
@@ -485,11 +546,14 @@ pause
         Write-Log "========================================="
         Write-Log "  安装完成！"
         Write-Log "  安装目录：$installDir"
-        Write-Log "  双击桌面 OpenNovel 快捷方式即可启动"
+        Write-Log ""
+        Write-Log "  使用方式："
+        Write-Log "  1. 双击桌面 OpenNovel 快捷方式即可开始写作"
+        Write-Log "  2. 如需上传番茄小说，先双击 setup-browser.bat 扫码登录"
         Write-Log "========================================="
 
         [System.Windows.Forms.MessageBox]::Show(
-            "安装完成！`n`n双击桌面 OpenNovel 快捷方式即可启动。`n安装目录：$installDir",
+            "安装完成！`n`n使用方式：`n1. 双击桌面 OpenNovel 快捷方式开始写作`n2. 如需上传番茄小说，先双击安装目录下的 setup-browser.bat 扫码登录`n`n安装目录：$installDir",
             "安装成功",
             "OK",
             "Information"

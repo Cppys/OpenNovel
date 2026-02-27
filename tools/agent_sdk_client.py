@@ -101,6 +101,13 @@ class AgentSDKClient:
             }
             if max_turns and max_turns > 1:
                 options_kwargs["permission_mode"] = "bypassPermissions"
+                git_bash = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+                if git_bash:
+                    # Use Git Bash to avoid WSL popup windows on Windows
+                    options_kwargs["env"] = {"CLAUDE_CODE_GIT_BASH_PATH": git_bash}
+                elif sys.platform == "win32":
+                    # No Git Bash found — disable Bash tool to avoid WSL popups
+                    options_kwargs["disallowed_tools"] = ["Bash"]
             async for message in query(
                 prompt=user_prompt,
                 options=ClaudeAgentOptions(**options_kwargs),
