@@ -71,6 +71,10 @@ class NovelWorkflowState(TypedDict, total=False):
     # Outline generation
     outline_batch_size: int  # Override default outline batch size (default 5)
 
+    # Global review fix pipeline
+    global_review_issues: list  # Fixable issues from global_review → fix_inconsistencies
+    fixed_chapters: list        # Chapter numbers that were auto-fixed
+
     # Control flow
     error: str
     should_stop: bool

@@ -12,7 +12,7 @@ from models.chapter import Chapter, Outline
 from models.character import Character, WorldSetting, PlotEvent
 from models.enums import (
     NovelStatus, ChapterStatus, CharacterRole, CharacterStatus,
-    EventType, EventImportance,
+    EventType, EventImportance, ShortStoryStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,27 @@ _MIGRATION_SQL = [
     "ALTER TABLE novels ADD COLUMN planning_metadata TEXT",
     # Clean up AUTOINCREMENT tracker so IDs can be reused
     "DELETE FROM sqlite_sequence WHERE name = 'novels'",
+    # Short stories table
+    """CREATE TABLE IF NOT EXISTS short_stories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL DEFAULT '',
+        genre TEXT NOT NULL DEFAULT '',
+        synopsis TEXT DEFAULT '',
+        content TEXT DEFAULT '',
+        char_count INTEGER DEFAULT 0,
+        category_ids TEXT DEFAULT '',
+        planning_data TEXT,
+        style_guide TEXT DEFAULT '',
+        status TEXT DEFAULT 'planning',
+        review_score REAL,
+        review_notes TEXT,
+        revision_count INTEGER DEFAULT 0,
+        fanqie_item_id TEXT,
+        published_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_short_stories_status ON short_stories(status)",
 ]
 
 
@@ -636,3 +657,68 @@ class Database:
                 (novel_id, chapter_number),
             )
             return cursor.rowcount > 0
+
+    # ---- Short Story CRUD ----
+
+    def create_short_story(
+        self,
+        title: str = "",
+        genre: str = "",
+        synopsis: str = "",
+        planning_data: str = "",
+        style_guide: str = "",
+    ) -> int:
+        """Create a new short story record. Returns the story id."""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "INSERT INTO short_stories (title, genre, synopsis, planning_data, "
+                "style_guide, status) VALUES (?, ?, ?, ?, ?, ?)",
+                (title, genre, synopsis, planning_data, style_guide,
+                 ShortStoryStatus.PLANNING.value),
+            )
+            return cursor.lastrowid
+
+    def get_short_story(self, story_id: int) -> Optional[dict]:
+        """Return a short story as a dict, or None."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM short_stories WHERE id = ?", (story_id,)
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def update_short_story(self, story_id: int, **fields):
+        """Update arbitrary fields on a short story."""
+        if not fields:
+            return
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        values = list(fields.values()) + [story_id]
+        with self._get_conn() as conn:
+            conn.execute(
+                f"UPDATE short_stories SET {set_clause}, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                values,
+            )
+
+    def list_short_stories(
+        self, status: Optional[str] = None
+    ) -> list[dict]:
+        """Return all short stories, optionally filtered by status."""
+        with self._get_conn() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM short_stories WHERE status = ? ORDER BY id DESC",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM short_stories ORDER BY id DESC"
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_short_story(self, story_id: int):
+        """Delete a short story."""
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM short_stories WHERE id = ?", (story_id,))
+        logger.info("Short story %d deleted", story_id)

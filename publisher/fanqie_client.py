@@ -433,6 +433,84 @@ class FanqieClient:
         logger.info("Article published: item_id=%s, title=%s", item_id, title)
         return item_id
 
+    # ---- Chapter query / modify APIs ------------------------------------
+
+    async def get_chapter_list(
+        self,
+        book_id: str,
+        volume_id: str = "",
+        page_index: int = 0,
+        page_count: int = 100,
+    ) -> list[dict]:
+        """Return the chapter list for a book (published + drafts).
+
+        Each item contains: item_id, title, word_count, status, etc.
+        """
+        params = {
+            "book_id": book_id,
+            "page_index": str(page_index),
+            "page_count": str(page_count),
+            "status": "0",
+            "must_have_correction_feedback": "0",
+            "need_correction_feedback_num": "1",
+            "sort": "",
+        }
+        if volume_id:
+            params["volume_id"] = volume_id
+
+        data = await self._get("/api/author/chapter/chapter_list/v1", params)
+        if isinstance(data, dict):
+            return data.get("chapter_list", [])
+        if isinstance(data, list):
+            return data
+        return []
+
+    async def get_chapter_content(self, book_id: str, item_id: str) -> dict:
+        """Load a chapter's content for editing.
+
+        Returns dict with keys: title, content (HTML), word_count, etc.
+        """
+        data = await self._get("/api/author/edit_article/v0/", {
+            "book_id": book_id,
+            "item_id": item_id,
+            "from_source": "0",
+        })
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    async def modify_chapter(
+        self,
+        book_id: str,
+        item_id: str,
+        content: str,
+        title: str = "",
+    ) -> bool:
+        """Modify an already-published chapter with new content.
+
+        Args:
+            book_id: The book ID.
+            item_id: The chapter's item_id on Fanqie.
+            content: New chapter content (plain text, will be converted to HTML).
+            title: New title (optional, keeps original if empty).
+
+        Returns:
+            True if modification was submitted successfully.
+        """
+        html_content = _text_to_html(content)
+
+        form = {
+            "book_id": book_id,
+            "item_id": item_id,
+            "content": html_content,
+        }
+        if title:
+            form["title"] = title
+
+        await self._post("/api/author/publish_article/v0/", form)
+        logger.info("Chapter modified: item_id=%s, title=%s", item_id, title or "(unchanged)")
+        return True
+
     # ---- High-level batch upload ----------------------------------------
 
     async def publish_chapters(

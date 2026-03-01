@@ -34,3 +34,10 @@ htmlcov/
 # Local dev / private docs
 demo.py
 fanqie-api-docs.md
+
+# Playwright logs/snapshots
+.playwright-cli/
+.playwright-mcp/
+
+# Generated exports
+exports/

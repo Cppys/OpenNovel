@@ -46,6 +46,13 @@ def route_after_memory_update(state: NovelWorkflowState) -> str:
     return "advance_chapter"
 
 
+def route_after_global_review(state: NovelWorkflowState) -> str:
+    """Route after global review: fix inconsistencies or advance chapter."""
+    if state.get("global_review_issues"):
+        return "fix_inconsistencies"
+    return "advance_chapter"
+
+
 def route_after_advance(state: NovelWorkflowState) -> str:
     """Route after advancing chapter: more to write or done."""
     if state.get("should_stop", False):

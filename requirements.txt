@@ -11,6 +11,7 @@ jieba>=0.42.1
 playwright>=1.40.0
 rich>=13.0.0
 sentence-transformers>=2.0.0
+python-docx>=0.8.11
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 pytest-mock>=3.12.0

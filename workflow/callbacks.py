@@ -69,6 +69,7 @@ class RichProgressCallback:
         "save_chapter": "保存章节",
         "update_memory": "更新记忆库",
         "global_review": "全局一致性审核",
+        "fix_inconsistencies": "修复一致性问题",
         "advance_chapter": "推进章节",
         "handle_error": "处理错误",
     }
@@ -85,7 +86,8 @@ class RichProgressCallback:
         "save_chapter": "更新记忆库",
         "update_memory": "推进章节",
         "advance_chapter": "加载章节大纲",
-        "global_review": "推进章节",
+        "global_review": "修复一致性问题",
+        "fix_inconsistencies": "推进章节",
     }
 
     def __init__(self, console=None, total_chapters: int = 0):
@@ -218,6 +220,7 @@ class ChatProgressCallback:
         "save_chapter": "保存章节",
         "update_memory": "更新记忆库",
         "global_review": "全局一致性审核",
+        "fix_inconsistencies": "修复一致性问题",
         "advance_chapter": "推进章节",
         "handle_error": "处理错误",
     }
@@ -233,7 +236,8 @@ class ChatProgressCallback:
         "save_chapter": "更新记忆库",
         "update_memory": "推进章节",
         "advance_chapter": "加载章节大纲",
-        "global_review": "推进章节",
+        "global_review": "修复一致性问题",
+        "fix_inconsistencies": "推进章节",
     }
 
     def __init__(self, console=None):

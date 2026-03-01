@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from typing import Optional
 
 from langgraph.graph import StateGraph, END
@@ -14,9 +15,10 @@ from memory.chroma_store import ChromaStore
 from models.database import Database
 from models.novel import Novel, Volume
 from models.chapter import Chapter, Outline
-from models.character import Character, WorldSetting
+from models.character import Character, WorldSetting, PlotEvent
 from models.enums import (
     NovelStatus, ChapterStatus, CharacterRole, CharacterStatus,
+    EventType, EventImportance,
 )
 from tools.agent_sdk_client import AgentSDKClient
 from tools.text_utils import count_chinese_chars
@@ -33,6 +35,7 @@ from workflow.conditions import (
     route_after_plan,
     route_after_review,
     route_after_memory_update,
+    route_after_global_review,
     route_after_advance,
 )
 
@@ -622,6 +625,16 @@ async def write_chapter(state: NovelWorkflowState) -> dict:
     r = _get_resources()
     writer = WriterAgent(llm_client=r.llm, settings=r.settings)
 
+    # Build existing titles list for dedup checking
+    existing_titles = ""
+    novel_id = state.get("novel_id")
+    if novel_id:
+        chapters = r.db.get_chapters(novel_id)
+        if chapters:
+            existing_titles = "\n".join(
+                f"第{ch.chapter_number}章: {ch.title}" for ch in chapters if ch.title
+            )
+
     try:
         result = await writer.write_chapter(
             genre=state.get("genre", ""),
@@ -633,6 +646,7 @@ async def write_chapter(state: NovelWorkflowState) -> dict:
             emotional_tone=state.get("emotional_tone", ""),
             hook_type=state.get("hook_type", "cliffhanger"),
             target_chapters=state.get("target_chapters", 0),
+            existing_titles=existing_titles,
             on_event=_make_thinking_forwarder("写作"),
         )
     except LLMError as e:
@@ -666,18 +680,41 @@ async def edit_chapter(state: NovelWorkflowState) -> dict:
         content = state.get("draft_content", "")
         char_count = state.get("draft_char_count", 0)
 
+    # Build existing titles list for dedup checking
+    existing_titles = ""
+    novel_id = state.get("novel_id")
+    current_ch = state.get("current_chapter", 0)
+    if novel_id:
+        chapters = r.db.get_chapters(novel_id)
+        if chapters:
+            existing_titles = "\n".join(
+                f"第{ch.chapter_number}章: {ch.title}"
+                for ch in chapters if ch.title and ch.chapter_number != current_ch
+            )
+
+    chapter_title = state.get("draft_title", "")
+
     try:
         result = await editor.edit_chapter(
             chapter_content=content,
             chapter_outline=state.get("chapter_outline", ""),
             char_count=char_count,
             review_issues=review_issues,
+            chapter_title=chapter_title,
+            chapter_number=current_ch,
+            existing_titles=existing_titles,
+            previous_ending=state.get("previous_ending", ""),
             on_event=_make_thinking_forwarder("编辑"),
         )
     except LLMError as e:
         return {"error": str(e), "last_node": "edit_chapter"}
 
+    # If editor suggested a new title, use it
+    new_title = result.get("new_title", "")
+    updated_title = new_title if new_title and new_title != chapter_title else chapter_title
+
     return {
+        "draft_title": updated_title,
         "edited_content": result["content"],
         "edited_char_count": result["char_count"],
         "edit_notes": result["edit_notes"],
@@ -691,12 +728,28 @@ async def review_chapter(state: NovelWorkflowState) -> dict:
     r = _get_resources()
     reviewer = ReviewerAgent(llm_client=r.llm, settings=r.settings)
 
+    # Build existing titles list for dedup checking
+    existing_titles = ""
+    novel_id = state.get("novel_id")
+    current_ch = state.get("current_chapter", 0)
+    if novel_id:
+        chapters = r.db.get_chapters(novel_id)
+        if chapters:
+            existing_titles = "\n".join(
+                f"第{ch.chapter_number}章: {ch.title}"
+                for ch in chapters if ch.title and ch.chapter_number != current_ch
+            )
+
     try:
         result = await reviewer.review_chapter(
             chapter_content=state.get("edited_content", ""),
             chapter_outline=state.get("chapter_outline", ""),
             context_prompt=state.get("context_prompt", ""),
             char_count=state.get("edited_char_count"),
+            chapter_title=state.get("draft_title", ""),
+            chapter_number=current_ch,
+            existing_titles=existing_titles,
+            previous_ending=state.get("previous_ending", ""),
             on_event=_make_thinking_forwarder("审核"),
         )
     except LLMError as e:
@@ -790,23 +843,171 @@ async def update_memory(state: NovelWorkflowState) -> dict:
 
 
 async def global_review(state: NovelWorkflowState) -> dict:
-    """Periodic global consistency review (every N chapters)."""
+    """Periodic global consistency review (every N chapters).
+
+    Classifies inconsistencies into:
+    - Fixable: all referenced chapters are unpublished → passed to fix_inconsistencies node
+    - Deferred: some referenced chapters are published → stored as PlotEvent(INCONSISTENCY)
+    """
     logger.info("Entering node: global_review")
     r = _get_resources()
 
     memory_mgr = MemoryManagerAgent(db=r.db, chroma=r.chroma, llm_client=r.llm, settings=r.settings)
+    novel_id = state["novel_id"]
 
     try:
-        review_data = await memory_mgr.global_review(state["novel_id"])
-        inconsistencies = review_data.get("inconsistencies", [])
-        if inconsistencies:
-            logger.warning("Global review found %d inconsistencies:", len(inconsistencies))
-            for issue in inconsistencies:
-                logger.warning("  - %s", issue)
+        review_data = await memory_mgr.global_review(novel_id)
     except Exception as e:
         logger.warning("Global review failed (non-fatal): %s", e)
+        return {"last_node": "global_review", "global_review_issues": []}
 
-    return {"last_node": "global_review"}
+    inconsistencies = review_data.get("inconsistencies", [])
+    if not inconsistencies:
+        logger.info("Global review: no inconsistencies found")
+        return {"last_node": "global_review", "global_review_issues": []}
+
+    # Build a set of published chapter numbers for quick lookup
+    published_chapters: set[int] = set()
+    all_chapters = r.db.get_chapters(novel_id)
+    for ch in all_chapters:
+        if ch.status == ChapterStatus.PUBLISHED:
+            published_chapters.add(ch.chapter_number)
+
+    fixable_issues: list[dict] = []
+    deferred_count = 0
+
+    for issue in inconsistencies:
+        desc = issue if isinstance(issue, str) else str(issue)
+        # Extract referenced chapter numbers like 第5章, 第12章
+        referenced = [int(n) for n in re.findall(r"第(\d+)章", desc)]
+
+        if referenced and all(ch not in published_chapters for ch in referenced):
+            # All referenced chapters are unpublished — fixable
+            fixable_issues.append({
+                "description": desc,
+                "chapters": referenced,
+            })
+        else:
+            # Some/all referenced chapters are published, or no chapter ref — defer
+            # Store as PlotEvent so the writer can address it in future chapters
+            chapter_num = referenced[0] if referenced else state.get("current_chapter", 0)
+            r.db.create_plot_event(PlotEvent(
+                novel_id=novel_id,
+                chapter_number=chapter_num,
+                event_type=EventType.INCONSISTENCY,
+                description=f"[一致性问题] {desc}",
+                importance=EventImportance.MAJOR,
+            ))
+            deferred_count += 1
+
+    # Report stale threads from review_data as deferred PlotEvents too
+    stale_threads = review_data.get("stale_threads", [])
+    for thread in stale_threads:
+        thread_desc = thread if isinstance(thread, str) else str(thread)
+        r.db.create_plot_event(PlotEvent(
+            novel_id=novel_id,
+            chapter_number=state.get("current_chapter", 0),
+            event_type=EventType.INCONSISTENCY,
+            description=f"[悬置线索] {thread_desc}",
+            importance=EventImportance.NORMAL,
+        ))
+        deferred_count += 1
+
+    logger.info(
+        "Global review classified: %d fixable, %d deferred",
+        len(fixable_issues), deferred_count,
+    )
+
+    # Report via callback
+    if _active_callback and hasattr(_active_callback, '_print'):
+        _active_callback._print(
+            f"  [dim]--[/] [yellow]一致性审核: {len(fixable_issues)} 个可修复, "
+            f"{deferred_count} 个已记录待后续处理[/]"
+        )
+
+    return {
+        "last_node": "global_review",
+        "global_review_issues": fixable_issues,
+    }
+
+
+async def fix_inconsistencies(state: NovelWorkflowState) -> dict:
+    """Auto-fix inconsistencies in unpublished chapters via the editor agent."""
+    logger.info("Entering node: fix_inconsistencies")
+    r = _get_resources()
+
+    issues = state.get("global_review_issues", [])
+    if not issues:
+        return {"last_node": "fix_inconsistencies", "global_review_issues": [], "fixed_chapters": []}
+
+    novel_id = state["novel_id"]
+    editor = EditorAgent(llm_client=r.llm, settings=r.settings)
+
+    # Group issues by chapter number
+    chapter_issues: dict[int, list[str]] = {}
+    for issue in issues:
+        for ch_num in issue.get("chapters", []):
+            chapter_issues.setdefault(ch_num, []).append(issue["description"])
+
+    fixed_chapters: list[int] = []
+
+    for ch_num, descriptions in chapter_issues.items():
+        chapter = r.db.get_chapter(novel_id, ch_num)
+        if not chapter:
+            logger.warning("Chapter %d not found, skipping fix", ch_num)
+            continue
+
+        # Safety check: never modify published chapters
+        if chapter.status == ChapterStatus.PUBLISHED:
+            logger.warning("Chapter %d is published, skipping fix", ch_num)
+            continue
+
+        # Build review issues in the format EditorAgent expects
+        review_issues = [
+            {
+                "severity": "major",
+                "category": "一致性",
+                "description": desc,
+                "suggestion": "请根据全局审核结果修正此一致性问题",
+            }
+            for desc in descriptions
+        ]
+
+        try:
+            result = await editor.edit_chapter(
+                chapter_content=chapter.content,
+                chapter_outline=chapter.outline or "",
+                char_count=chapter.char_count,
+                review_issues=review_issues,
+                chapter_title=chapter.title,
+                chapter_number=ch_num,
+            )
+
+            # Update chapter in DB
+            chapter.content = result["content"]
+            chapter.char_count = result["char_count"]
+            if result.get("edit_notes"):
+                chapter.review_notes = (chapter.review_notes or "") + f"\n[一致性修复] {result['edit_notes']}"
+            r.db.update_chapter(chapter)
+
+            fixed_chapters.append(ch_num)
+            logger.info("Chapter %d fixed (%d issues)", ch_num, len(descriptions))
+
+        except Exception as e:
+            logger.warning("Failed to fix chapter %d (non-fatal): %s", ch_num, e)
+
+    # Report via callback
+    if _active_callback and hasattr(_active_callback, '_print') and fixed_chapters:
+        ch_list = ", ".join(f"第{n}章" for n in fixed_chapters)
+        _active_callback._print(
+            f"  [dim]--[/] [green]已修复: {ch_list}[/]"
+        )
+
+    return {
+        "last_node": "fix_inconsistencies",
+        "global_review_issues": [],
+        "fixed_chapters": fixed_chapters,
+    }
 
 
 async def advance_chapter(state: NovelWorkflowState) -> dict:
@@ -892,6 +1093,7 @@ def build_graph(checkpointer=None) -> StateGraph:
     graph.add_node("save_chapter", save_chapter)
     graph.add_node("update_memory", update_memory)
     graph.add_node("global_review", global_review)
+    graph.add_node("fix_inconsistencies", fix_inconsistencies)
     graph.add_node("advance_chapter", advance_chapter)
     graph.add_node("handle_error", handle_error)
 
@@ -948,8 +1150,18 @@ def build_graph(checkpointer=None) -> StateGraph:
         },
     )
 
-    # global_review -> advance
-    graph.add_edge("global_review", "advance_chapter")
+    # Conditional: after global review -> fix_inconsistencies or advance
+    graph.add_conditional_edges(
+        "global_review",
+        route_after_global_review,
+        {
+            "fix_inconsistencies": "fix_inconsistencies",
+            "advance_chapter": "advance_chapter",
+        },
+    )
+
+    # fix_inconsistencies -> advance
+    graph.add_edge("fix_inconsistencies", "advance_chapter")
 
     # Conditional: after advance -> next chapter or END
     graph.add_conditional_edges(
@@ -1031,7 +1243,7 @@ async def run_workflow(
     # Calculate recursion limit based on number of chapters.
     # Each chapter cycle uses ~8 nodes; revisions and global reviews can add more.
     num_chapters = len(chapter_list) if chapter_list else target_chapters
-    recursion_limit = max(50, num_chapters * 15 + 30)
+    recursion_limit = max(50, num_chapters * 16 + 30)
 
     config = {"recursion_limit": recursion_limit}
     if thread_id:

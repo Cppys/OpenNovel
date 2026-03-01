@@ -28,7 +28,7 @@ from tools.agent_sdk_client import AgentSDKClient
 logger = logging.getLogger(__name__)
 
 # 最多保留的对话轮数（每轮 = 1 user + 1 assistant）
-MAX_HISTORY_TURNS = 20
+MAX_HISTORY_TURNS = 100
 
 # ── 像素字 Banner ─────────────────────────────────────────────────────────
 
@@ -207,6 +207,11 @@ _ACTION_LABELS: dict[str, str] = {
     "rename_chapter":   "修改章节标题",
     "rename_volume":    "修改卷标题",
     "set_chapter_status": "修改章节状态",
+    "create_short_story": "创作短故事",
+    "list_short_stories": "短故事列表",
+    "publish_short_story": "发布短故事",
+    "export_novel":     "导出小说",
+    "export_short_story": "导出短故事",
 }
 
 # ── 动作系统提示 ──────────────────────────────────────────────────────────
@@ -252,9 +257,21 @@ _ACTION_SYSTEM_PROMPT = """\
   参数: volume_number(卷号), title(新标题)
 - set_chapter_status: 修改章节状态
   参数: chapters(章节范围，如"3"或"5-10"), status(目标状态: planned/drafted/edited/reviewed/published)
+- create_short_story: 创作短故事（自动规划→写作→编辑→审核→保存）
+  参数: genre(类型，如脑洞/悬疑惊悚/现言甜宠/婚姻家庭), premise(故事创意1-3句话),
+        target_chars(目标字数,默认10000), ideas(补充想法,可选)
+- list_short_stories: 列出所有短故事
+- publish_short_story: 将已完成的短故事发布到番茄
+  参数: story_id(短故事ID), mode("publish"发布 或 "draft"保存草稿，默认"draft"),
+        category_ids(分类ID列表,可选,如[1379,755])
+- export_novel: 导出小说为Word文档
+  参数: novel_id(小说ID，不填则用当前绑定小说)
+- export_short_story: 导出短故事为Word文档
+  参数: story_id(短故事ID)
 
 规则：
-- 每条回复最多一个动作
+- 同一条回复中可以包含多个动作（每个动作单独一行 <<<ACTION: ...>>>），系统会依次执行
+- 批量操作时尽量合并：例如需要读取第40-43章大纲，应在一条回复中发4个 read_outline 动作，而不是一条一条发
 - 先用文字解释你要做什么，然后在回复末尾放动作
 - create_novel 执行前必须与用户确认以下参数（用户没说明的需询问，或用括号内默认值）：
   · 小说类型（genre）
@@ -266,17 +283,37 @@ _ACTION_SYSTEM_PROMPT = """\
 - delete_novel 是不可逆操作，必须用户明确再次确认后才能执行
 - delete_volume 和 delete_chapters 也是不可逆操作，需用户确认
 - publish_chapters 需要用户事先完成 opennovel setup-browser 登录
+- create_short_story 执行前需确认：类型（genre）、创意（premise）、目标字数（默认10000）
+- publish_short_story 需要用户事先完成 opennovel setup-browser 登录
 - 动作的JSON必须是合法的JSON格式
 
-文件操作能力：
-除了上述动作，你还拥有 Claude Code 内置的文件读写工具（Read、Write、Edit、Glob、Grep、Bash），
-可以直接操作项目中的任何文件。当用户的需求超出上述动作列表时，直接用文件工具完成。例如：
-- 查看或修改配置文件（.env、config/settings.py）
-- 查看或修改 Agent 的 prompt 模板（config/prompts/*.md）
-- 切换某个 Agent 使用的模型（编辑 .env 中对应的 LLM_MODEL_* 变量）
-- 查看或修改项目源代码
-- 任何其他涉及文件读写的操作
-优先使用动作系统处理小说 CRUD，其余操作直接使用文件工具。
+########## 最高优先级规则 — 必须遵守 ##########
+
+数据库操作 vs 文件操作的严格分界：
+
+1. 小说数据（章节、大纲、角色、小说信息）全部存储在 SQLite 数据库中。
+   → 对这些数据的任何读写（读章节、写章节、改章节、读大纲、创建小说……）
+     必须且只能通过在回复文本中嵌入 <<<ACTION: {...}>>> 标签完成。
+   → 绝对禁止用 Read/Write/Edit/Bash 等文件工具直接操作 data/novels.db。
+
+2. 你同时拥有 Claude Code 的文件工具（Read、Write、Edit、Glob、Grep、Bash）。
+   这些工具只能用于普通文本文件，例如：
+   - .env、config/settings.py 等配置文件
+   - config/prompts/*.md 等提示词模板
+   - 项目源代码文件
+   绝对不能用文件工具来读写小说章节/大纲/角色等数据库内容。
+
+3. 当你需要保存、更新、读取章节内容时，你的回复里必须包含 ACTION 标签。
+   正确示例：
+     我已经重写了第42章的内容，现在帮你更新到数据库。
+     <<<ACTION: {"action": "edit_chapter", "chapter_number": 42, "content": "重写后的完整内容..."}>>>
+   错误示例（绝对禁止）：
+     好的，我来更新第42章。（← 没有 ACTION 标签，什么都不会发生！）
+
+4. 如果你说了"我来更新/保存/修改章节"却没有附带 ACTION 标签，系统不会执行任何操作。
+   用户会看到你说了要做但什么都没做。所以每次涉及数据库操作，必须带 ACTION 标签。
+
+####################################################
 """
 
 
@@ -321,6 +358,16 @@ class ChatSession:
                 )
                 parts.append(f"用户的小说列表：\n{novel_list}")
                 parts.append("当前未绑定小说。如果用户想操作已有小说，使用 switch_novel 动作切换。")
+
+        # 短故事列表
+        short_stories = self.db.list_short_stories()
+        if short_stories:
+            ss_list = "\n".join(
+                f"  {s['id']}. 《{s.get('title', '未命名')}》"
+                f"({s.get('genre', '?')}, {s.get('char_count', 0)}字, {s.get('status', '?')})"
+                for s in short_stories[:10]
+            )
+            parts.append(f"用户的短故事列表：\n{ss_list}")
 
         return "\n\n".join(parts)
 
@@ -482,7 +529,7 @@ class ChatSession:
 
         渲染工作在此方法内完成，包括首次回复和所有续写回复。
         """
-        MAX_AUTO_CONTINUES = 5
+        MAX_AUTO_CONTINUES = 50
 
         # ── Compress history if too long ──
         await self._compress_history_if_needed()
@@ -595,6 +642,16 @@ class ChatSession:
                 return self._action_rename_volume(action)
             elif name == "set_chapter_status":
                 return self._action_set_chapter_status(action)
+            elif name == "create_short_story":
+                return await self._action_create_short_story(action)
+            elif name == "list_short_stories":
+                return self._action_list_short_stories()
+            elif name == "publish_short_story":
+                return await self._action_publish_short_story(action)
+            elif name == "export_novel":
+                return self._action_export_novel(action)
+            elif name == "export_short_story":
+                return self._action_export_short_story(action)
             else:
                 return f"未知动作: {name}"
         except Exception as e:
@@ -1336,23 +1393,227 @@ class ChatSession:
             return f"publish_chapters 失败: 上传出错 ({e})"
 
         success_count = 0
+        fail_details = []
+        success_details = []
         for ch, result in zip(reviewed, results):
             if result.get("success"):
                 success_count += 1
                 ch.status = ChapterStatus.PUBLISHED
                 ch.fanqie_chapter_id = result.get("item_id", "")
                 self.db.update_chapter(ch)
+                success_details.append(f"第{ch.chapter_number}章「{ch.title}」已发布")
                 self.console.print(
                     f"  [dim]--[/] [green]第{ch.chapter_number}章 "
                     f"{'已发布' if mode == 'publish' else '草稿已保存'}[/]"
                 )
             else:
+                err_msg = result.get('message', '未知错误')
+                fail_details.append(f"第{ch.chapter_number}章「{ch.title}」失败: {err_msg}")
                 self.console.print(
-                    f"  [dim]--[/] [red]第{ch.chapter_number}章失败: "
-                    f"{result.get('message', '未知错误')}[/]"
+                    f"  [dim]--[/] [red]第{ch.chapter_number}章失败: {err_msg}[/]"
                 )
 
-        return f"上传完成：成功 {success_count}/{len(reviewed)} 章"
+        # Build comprehensive result for AI
+        parts = [f"上传完成：成功 {success_count}/{len(reviewed)} 章"]
+        if success_details:
+            parts.append("成功章节：" + "；".join(success_details))
+        if fail_details:
+            parts.append("失败详情：\n" + "\n".join(fail_details))
+        return "\n".join(parts)
+
+    # ── 短故事动作 ────────────────────────────────────────────────────
+
+    async def _action_create_short_story(self, action: dict) -> str:
+        """创建并撰写短故事（走完整的规划→写作→编辑→审核→保存流程）。"""
+        from workflow.short_story_graph import run_short_story_workflow
+
+        genre = action.get("genre", "")
+        premise = action.get("premise", "")
+        target_chars = action.get("target_chars", 10000)
+        ideas = action.get("ideas", "")
+
+        if not genre or not premise:
+            return "create_short_story 失败: 缺少 genre 或 premise 参数"
+
+        self.console.print()
+        self.console.print(
+            f"  [dim]创建短故事: {genre} · {premise} · "
+            f"目标{target_chars}字[/]"
+        )
+
+        class _ChatShortStoryCB:
+            def __init__(self, console):
+                self._console = console
+            def update_status(self, msg: str):
+                is_tui = not isinstance(self._console, Console)
+                if is_tui:
+                    self._console.update_status(msg)
+                else:
+                    self._console.print(f"  [dim]{msg}[/]")
+
+        cb = _ChatShortStoryCB(self.console)
+        final_state = await run_short_story_workflow(
+            genre=genre,
+            premise=premise,
+            ideas=ideas,
+            target_chars=int(target_chars),
+            mode="new",
+            publish_mode="draft",
+            callback=cb,
+        )
+
+        error = final_state.get("error", "")
+        if error:
+            return f"create_short_story 失败: {error}"
+
+        story_id = final_state.get("story_id", 0)
+        title = final_state.get("title", "未命名")
+        char_count = final_state.get("edited_char_count") or final_state.get("char_count", 0)
+        review = final_state.get("review_result", {})
+        score = review.get("score", 0)
+
+        self.console.print(
+            f"  [dim]--[/] [green]短故事创作完成！[/]"
+        )
+        return (
+            f"短故事创作完成！\n"
+            f"  标题: 《{title}》\n"
+            f"  ID: {story_id}\n"
+            f"  字数: {char_count:,}\n"
+            f"  评分: {score:.1f}\n"
+            f"  状态: 已保存到本地数据库\n"
+            f"  如需发布到番茄，使用 publish_short_story 动作"
+        )
+
+    def _action_list_short_stories(self) -> str:
+        """列出所有短故事。"""
+        stories = self.db.list_short_stories()
+        if not stories:
+            return "暂无短故事记录。使用 create_short_story 动作创建。"
+
+        lines = ["短故事列表："]
+        for s in stories:
+            score = s.get("review_score")
+            score_str = f"评分{score:.1f}" if score else "未评分"
+            lines.append(
+                f"  {s['id']}. 《{s.get('title', '未命名')}》"
+                f"（{s.get('genre', '?')} · {s.get('char_count', 0)}字 · "
+                f"{s.get('status', '?')} · {score_str}）"
+            )
+
+        result = "\n".join(lines)
+        self.console.print(f"  [dim]--[/] [green]共{len(stories)}篇短故事[/]")
+        return result
+
+    async def _action_publish_short_story(self, action: dict) -> str:
+        """将短故事发布到番茄小说平台。"""
+        from agents.publisher_agent import PublisherAgent
+        from publisher.short_story_client import FanqieShortStoryClient
+
+        story_id = action.get("story_id")
+        if not story_id:
+            return "publish_short_story 失败: 缺少 story_id 参数"
+
+        story = self.db.get_short_story(int(story_id))
+        if not story:
+            return f"publish_short_story 失败: 未找到 ID 为 {story_id} 的短故事"
+
+        content = story.get("content", "")
+        if not content:
+            return "publish_short_story 失败: 短故事内容为空"
+
+        title = story.get("title", "未命名短故事")
+        mode = action.get("mode", "draft")
+        category_ids = action.get("category_ids", [])
+
+        # Default category if not specified
+        if not category_ids:
+            genre = story.get("genre", "")
+            genre_map = {
+                "婚姻家庭": [1379], "女生生活": [1380], "男生生活": [1381],
+                "现言甜宠": [395], "虐心婚恋": [1383], "青春虐恋": [1382],
+                "男生情感": [1384], "脑洞": [755], "社会伦理": [1146],
+                "女性成长": [1048], "悬疑惊悚": [1385], "古代言情": [5],
+                "玄幻仙侠": [1013], "宫斗宅斗": [246], "年代": [79],
+                "纯爱": [1012],
+            }
+            category_ids = genre_map.get(genre, [755])
+
+        self.console.print(
+            f"  [dim]发布短故事《{title}》到番茄 (模式: {mode})...[/]"
+        )
+
+        publisher = PublisherAgent(settings=self.settings)
+        try:
+            await publisher.launch_browser(use_auth_state=True)
+            logged_in = await publisher.ensure_logged_in()
+            if not logged_in:
+                return "publish_short_story 失败: 未登录番茄，请先运行 opennovel setup-browser"
+
+            client = FanqieShortStoryClient(publisher._browser_mgr.page)
+
+            item_id = await client.publish_short_story(
+                title=title,
+                content=content,
+                category_ids=category_ids,
+                authorize_type=1,
+                publish_mode=mode,
+            )
+
+            # Update local database
+            from models.enums import ShortStoryStatus
+            new_status = ShortStoryStatus.PUBLISHED.value if mode == "publish" else ShortStoryStatus.DRAFT.value
+            self.db.update_short_story(
+                int(story_id),
+                fanqie_item_id=item_id,
+                status=new_status,
+            )
+
+            self.console.print(
+                f"  [dim]--[/] [green]短故事已{'发布' if mode == 'publish' else '保存为草稿'}[/]"
+            )
+            return (
+                f"短故事《{title}》已{'发布' if mode == 'publish' else '保存为草稿'}到番茄！\n"
+                f"  番茄 item_id: {item_id}\n"
+                f"  分类: {category_ids}"
+            )
+        except Exception as e:
+            logger.exception("Short story publish failed")
+            return f"publish_short_story 失败: {e}"
+        finally:
+            await publisher.close()
+
+    def _action_export_novel(self, action: dict) -> str:
+        """导出小说为 Word 文档。"""
+        from tools.word_exporter import export_novel_to_word
+
+        novel_id = action.get("novel_id")
+        if not novel_id and self.novel:
+            novel_id = self.novel.id
+        if not novel_id:
+            return "export_novel 失败: 缺少 novel_id 参数，且未绑定小说"
+
+        try:
+            path = export_novel_to_word(self.db, int(novel_id))
+            self.console.print(f"  [dim]--[/] [green]已导出到: {path.resolve()}[/]")
+            return f"小说已导出为 Word 文档: {path.resolve()}"
+        except ValueError as e:
+            return f"export_novel 失败: {e}"
+
+    def _action_export_short_story(self, action: dict) -> str:
+        """导出短故事为 Word 文档。"""
+        from tools.word_exporter import export_short_story_to_word
+
+        story_id = action.get("story_id")
+        if not story_id:
+            return "export_short_story 失败: 缺少 story_id 参数"
+
+        try:
+            path = export_short_story_to_word(self.db, int(story_id))
+            self.console.print(f"  [dim]--[/] [green]已导出到: {path.resolve()}[/]")
+            return f"短故事已导出为 Word 文档: {path.resolve()}"
+        except ValueError as e:
+            return f"export_short_story 失败: {e}"
 
     # ── 斜杠命令（精简版）────────────────────────────────────────────
 

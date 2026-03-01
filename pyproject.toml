@@ -21,6 +21,7 @@ dependencies = [
     "rich>=13.0.0",
     "textual>=0.50.0",
     "sentence-transformers>=2.0.0",
+    "python-docx>=0.8.11",
 ]
 
 [project.optional-dependencies]

@@ -36,7 +36,7 @@ from cli.theme import (
 from config.settings import Settings
 from config.logging_config import setup_logging
 from models.database import Database
-from models.enums import NovelStatus, ChapterStatus
+from models.enums import NovelStatus, ChapterStatus, ShortStoryStatus
 from workflow.callbacks import RichProgressCallback
 
 console = get_console()
@@ -65,6 +65,7 @@ def cli(ctx, verbose, novel_id):
     或使用子命令直接控制：
       opennovel new -g 玄幻 -p "少年获得传承"
       opennovel write -n 1 -c 1-10
+      opennovel short-story -g 脑洞 -p "快递员发现包裹里是收件人的未来"
       opennovel status
     """
     _init_logging(verbose)
@@ -407,6 +408,216 @@ def continue_novel(novel_id, chapters):
 
 
 # ---------------------------------------------------------------------------
+# short-story command
+# ---------------------------------------------------------------------------
+
+@cli.command(name="short-story")
+@click.option("--genre", "-g", required=True, help="故事类型（如：脑洞、悬疑惊悚、现言甜宠、婚姻家庭）")
+@click.option("--premise", "-p", required=True, help="故事创意/设定（1-3 句话）")
+@click.option("--target", "-t", default=10000, type=int, help="目标字数（默认 10000）")
+@click.option("--ideas", "-i", default="", help="补充想法/创意备注（可选）")
+@click.option("--publish", "publish_mode", flag_value="publish", default=False, help="写完后自动发布到番茄")
+@click.option("--draft", "publish_mode", flag_value="draft", help="写完后保存为番茄草稿")
+def short_story(genre, premise, target, ideas, publish_mode):
+    """创建并撰写一篇短故事（规划→写作→编辑→审核→保存）。
+
+    \b
+    示例：
+      opennovel short-story -g 脑洞 -p "快递员发现每个包裹里都是收件人的未来"
+      opennovel short-story -g 悬疑惊悚 -p "深夜值班护士发现ICU多了一个病人" -t 15000
+      opennovel short-story -g 现言甜宠 -p "假装情侣却弄假成真" --draft
+    """
+    from workflow.short_story_graph import run_short_story_workflow
+
+    console.print(app_header())
+    console.print()
+
+    fields = {
+        "类型": genre,
+        "设定": premise,
+        "目标字数": f"{target:,}",
+    }
+    if ideas:
+        fields["想法"] = ideas
+    if publish_mode:
+        fields["发布"] = "直接发布" if publish_mode == "publish" else "保存草稿"
+    console.print(command_panel("创建短故事", fields))
+    console.print()
+
+    # Progress display
+    progress = Progress(
+        SpinnerColumn("dots"),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    )
+    progress_task_id = None
+
+    class ShortStoryCallback:
+        """Minimal callback that updates the progress bar for short story workflow."""
+
+        def update_status(self, msg: str):
+            if progress_task_id is not None:
+                progress.update(progress_task_id, description=f"  {msg}")
+
+    try:
+        cb = ShortStoryCallback()
+        progress.start()
+        progress_task_id = progress.add_task("  准备中...", total=None)
+
+        try:
+            final_state = asyncio.run(run_short_story_workflow(
+                genre=genre,
+                premise=premise,
+                ideas=ideas,
+                target_chars=target,
+                mode="new",
+                publish_mode=publish_mode or "draft",
+                callback=cb,
+            ))
+        finally:
+            progress.stop()
+
+        console.print()
+
+        error = final_state.get("error", "")
+        if error:
+            console.print(f"\n[error]错误：{error}[/]")
+            sys.exit(1)
+
+        story_id = final_state.get("story_id", 0)
+        title = final_state.get("title", "未命名")
+        char_count = final_state.get("edited_char_count") or final_state.get("char_count", 0)
+        review = final_state.get("review_result", {})
+        score = review.get("score", 0)
+
+        console.print(success_panel("短故事完成", (
+            f"  标题: [bold]{title}[/]\n"
+            f"  ID: [stat.value]{story_id}[/]\n"
+            f"  字数: [stat.value]{char_count:,}[/]\n"
+            f"  评分: [stat.value]{score:.1f}[/]"
+        )))
+
+        if publish_mode:
+            console.print(f"\n[info]发布状态: {'已发布' if publish_mode == 'publish' else '已保存为草稿'}[/]")
+        else:
+            console.print(f"\n[info]短故事已保存到本地数据库 (ID: {story_id})[/]")
+
+    except KeyboardInterrupt:
+        console.print("\n[warning]已中断[/]")
+        sys.exit(130)
+    except Exception as e:
+        console.print(f"\n[error]短故事创作失败：{e}[/]")
+        logging.getLogger(__name__).exception("Short story workflow failed")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# publish-short command
+# ---------------------------------------------------------------------------
+
+@cli.command(name="publish-short")
+@click.option("--story-id", "-s", required=True, type=int, help="短故事ID")
+@click.option("--mode", "-m", default="draft", type=click.Choice(["draft", "publish"]),
+              help="发布模式：draft=保存草稿、publish=直接发布（默认draft）")
+@click.option("--category", "-c", default=None, type=str,
+              help="分类ID，逗号分隔（如 755,1379），不指定则根据类型自动匹配")
+def publish_short(story_id, mode, category):
+    """将短故事上传到番茄小说平台。
+
+    \b
+    示例：
+      opennovel publish-short -s 1                  # 保存为草稿
+      opennovel publish-short -s 1 -m publish        # 直接发布
+      opennovel publish-short -s 1 -c 755,1379       # 指定分类
+    """
+    from agents.publisher_agent import PublisherAgent
+    from publisher.short_story_client import FanqieShortStoryClient
+
+    settings = Settings()
+    db = Database(settings.sqlite_db_path)
+
+    story = db.get_short_story(story_id)
+    if not story:
+        console.print(f"[error]未找到ID为 {story_id} 的短故事[/]")
+        sys.exit(1)
+
+    content = story.get("content", "")
+    if not content:
+        console.print("[error]短故事内容为空，请先创作内容[/]")
+        sys.exit(1)
+
+    title = story.get("title", "未命名短故事")
+
+    # Parse category IDs
+    category_ids = []
+    if category:
+        category_ids = [int(x.strip()) for x in category.split(",")]
+    else:
+        genre = story.get("genre", "")
+        genre_map = {
+            "婚姻家庭": [1379], "女生生活": [1380], "男生生活": [1381],
+            "现言甜宠": [395], "虐心婚恋": [1383], "青春虐恋": [1382],
+            "男生情感": [1384], "脑洞": [755], "社会伦理": [1146],
+            "女性成长": [1048], "悬疑惊悚": [1385], "古代言情": [5],
+            "玄幻仙侠": [1013], "宫斗宅斗": [246], "年代": [79],
+            "纯爱": [1012],
+        }
+        category_ids = genre_map.get(genre, [755])
+
+    console.print(app_header())
+    console.print()
+    console.print(command_panel("发布短故事", {
+        "标题": title,
+        "ID": str(story_id),
+        "字数": f"{story.get('char_count', 0):,}",
+        "分类": str(category_ids),
+        "模式": "直接发布" if mode == "publish" else "保存草稿",
+    }))
+    console.print()
+
+    async def _publish():
+        publisher = PublisherAgent(settings=settings)
+        try:
+            await publisher.launch_browser(use_auth_state=True)
+            logged_in = await publisher.ensure_logged_in()
+            if not logged_in:
+                console.print("[error]未登录番茄，请先运行 opennovel setup-browser[/]")
+                return
+
+            client = FanqieShortStoryClient(publisher._browser_mgr.page)
+            item_id = await client.publish_short_story(
+                title=title,
+                content=content,
+                category_ids=category_ids,
+                authorize_type=1,
+                publish_mode=mode,
+            )
+
+            from models.enums import ShortStoryStatus
+            new_status = ShortStoryStatus.PUBLISHED.value if mode == "publish" else ShortStoryStatus.DRAFT.value
+            db.update_short_story(story_id, fanqie_item_id=item_id, status=new_status)
+
+            console.print(success_panel(
+                "发布完成",
+                f"  标题: [bold]{title}[/]\n"
+                f"  番茄 item_id: [stat.value]{item_id}[/]\n"
+                f"  状态: {'已发布' if mode == 'publish' else '已保存为草稿'}",
+            ))
+        finally:
+            await publisher.close()
+
+    try:
+        asyncio.run(_publish())
+    except KeyboardInterrupt:
+        console.print("\n[warning]已中断[/]")
+        sys.exit(130)
+    except Exception as e:
+        console.print(f"\n[error]发布失败：{e}[/]")
+        logging.getLogger(__name__).exception("Short story publish failed")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # publish command
 # ---------------------------------------------------------------------------
 
@@ -702,10 +913,17 @@ def status(novel_id):
         _show_novel_detail(db, novel)
     else:
         novels = db.list_novels()
-        if not novels:
-            console.print("[warning]暂无小说记录。使用 [info]opennovel new[/] 创建新小说。[/]")
+        short_stories = db.list_short_stories()
+        if not novels and not short_stories:
+            console.print("[warning]暂无小说或短故事记录。[/]")
+            console.print("[info]使用 opennovel new 创建小说，opennovel short-story 创建短故事。[/]")
             return
-        _show_novel_list(novels)
+        if novels:
+            _show_novel_list(novels)
+        if short_stories:
+            if novels:
+                console.print()
+            _show_short_story_list(db, short_stories)
 
 
 def _show_novel_list(novels):
@@ -736,7 +954,43 @@ def _show_novel_list(novels):
     console.print(table)
 
 
-def _show_novel_detail(db: Database, novel):
+def _show_short_story_list(db: Database, stories: list):
+    """Display a table of all short stories."""
+    table = Table(title="短故事列表", show_lines=True, border_style="dim")
+    table.add_column("ID", style="chapter.num")
+    table.add_column("标题", style="bold")
+    table.add_column("类型", style="genre")
+    table.add_column("字数", justify="right")
+    table.add_column("状态")
+    table.add_column("评分", justify="right")
+
+    for s in stories:
+        status_val = s.get("status", "")
+        status_color = {
+            "planning": "yellow",
+            "writing": "green",
+            "editing": "blue",
+            "reviewing": "cyan",
+            "draft": "magenta",
+            "published": "bright_green",
+        }.get(status_val, "white")
+
+        score = s.get("review_score")
+        score_str = f"{score:.1f}" if score else "-"
+
+        table.add_row(
+            str(s.get("id", "")),
+            s.get("title", "未命名"),
+            s.get("genre", "-"),
+            f"{s.get('char_count', 0):,}",
+            f"[{status_color}]{status_val}[/]",
+            score_str,
+        )
+
+    console.print(table)
+
+
+def _show_novel_detail(db, novel):
     """Display detailed info about a single novel."""
     chapters = db.get_chapters(novel.id)
     characters = db.get_characters(novel.id)
@@ -871,6 +1125,157 @@ def setup_browser():
             await publisher.close()
 
     asyncio.run(_setup())
+
+
+# ---------------------------------------------------------------------------
+# revise command
+# ---------------------------------------------------------------------------
+
+def _parse_chapter_range(spec: str) -> list[int]:
+    """Parse a chapter spec like '3', '1-10', '1,3,5', '1-3,7,9-12'."""
+    chapters = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            chapters.extend(range(int(start), int(end) + 1))
+        else:
+            chapters.append(int(part))
+    return sorted(set(chapters))
+
+
+@cli.command()
+@click.option("--novel-id", "-n", required=True, type=int, help="小说ID")
+@click.option("--chapters", "-c", default=None, type=str,
+              help="指定章节，如 '3' 或 '1-10' 或 '1,3,5-8'（不指定则修改全部已发布章节）")
+@click.option("--dry-run", is_flag=True, help="仅预览将要修改的章节，不实际提交")
+def revise(novel_id, chapters, dry_run):
+    """一键修改番茄小说上已发布的章节。
+
+    从本地数据库读取最新内容，推送到番茄小说平台覆盖已发布章节。
+    修改后本地章节状态更新为 revised。
+
+    \b
+    示例：
+      opennovel revise -n 1                   # 修改小说1的全部已发布章节
+      opennovel revise -n 1 -c 3              # 只修改第3章
+      opennovel revise -n 1 -c 1-10           # 修改第1-10章
+      opennovel revise -n 1 -c 1,3,5-8        # 修改第1,3,5,6,7,8章
+      opennovel revise -n 1 --dry-run         # 预览模式，不实际修改
+    """
+    settings = Settings()
+    db = Database(settings.sqlite_db_path)
+
+    novel = db.get_novel(novel_id)
+    if not novel:
+        console.print(f"[error]未找到ID为 {novel_id} 的小说[/]")
+        sys.exit(1)
+
+    if not novel.fanqie_book_id:
+        console.print(f"[error]小说《{novel.title}》尚未关联番茄小说平台（无 fanqie_book_id）[/]")
+        console.print("[dim]请先通过对话模式发布小说到番茄平台。[/]")
+        sys.exit(1)
+
+    console.print(app_header())
+    console.print()
+
+    # Get chapters from local DB
+    all_chapters = db.get_chapters(novel_id)
+    if not all_chapters:
+        console.print("[error]该小说暂无章节数据[/]")
+        sys.exit(1)
+
+    # Filter: only published/revised chapters with fanqie_chapter_id
+    eligible = [
+        ch for ch in all_chapters
+        if ch.fanqie_chapter_id
+        and ch.status in (ChapterStatus.PUBLISHED, ChapterStatus.REVISED, ChapterStatus.REVIEWED)
+        and ch.content
+    ]
+
+    if not eligible:
+        console.print("[error]没有可修改的章节（需已发布且有番茄章节ID）[/]")
+        sys.exit(1)
+
+    # Apply chapter range filter
+    if chapters:
+        target_nums = _parse_chapter_range(chapters)
+        eligible = [ch for ch in eligible if ch.chapter_number in target_nums]
+        if not eligible:
+            console.print(f"[error]指定的章节范围 {chapters} 中没有可修改的章节[/]")
+            sys.exit(1)
+
+    # Display summary
+    table = Table(title=f"将要修改的章节 — 《{novel.title}》", show_lines=True, border_style="dim")
+    table.add_column("章节", style="chapter.num", justify="right")
+    table.add_column("标题", style="bold")
+    table.add_column("字数", justify="right")
+    table.add_column("状态")
+    table.add_column("番茄ID", style="dim")
+
+    for ch in eligible:
+        table.add_row(
+            str(ch.chapter_number),
+            ch.title,
+            str(ch.char_count),
+            ch.status.value,
+            ch.fanqie_chapter_id,
+        )
+
+    console.print(table)
+    console.print(f"\n共 [bold]{len(eligible)}[/] 章将被修改推送到番茄小说平台。")
+
+    if dry_run:
+        console.print("\n[dim]（--dry-run 模式，未实际提交修改）[/]")
+        return
+
+    # Confirm
+    if not click.confirm("确认修改？"):
+        console.print("[dim]已取消[/]")
+        return
+
+    # Build chapter data for publisher
+    revision_data = []
+    for ch in eligible:
+        full_title = f"第 {ch.chapter_number} 章 {ch.title}"
+        if len(full_title) > 30:
+            full_title = full_title[:30]
+        revision_data.append({
+            "item_id": ch.fanqie_chapter_id,
+            "content": ch.content,
+            "title": full_title,
+            "chapter_number": ch.chapter_number,
+            "local_title": ch.title,
+        })
+
+    # Execute revision
+    from agents.publisher_agent import PublisherAgent
+
+    console.print("\n[bold]正在启动浏览器...[/]")
+    publisher = PublisherAgent(settings=settings)
+    results = publisher.revise_chapters_sync(
+        book_id=novel.fanqie_book_id,
+        chapters=revision_data,
+    )
+
+    # Display results and update local DB
+    success_count = 0
+    for i, result in enumerate(results):
+        ch = eligible[i]
+        if result["success"]:
+            success_count += 1
+            console.print(f"  [success]✓[/] 第{ch.chapter_number}章 {ch.title}")
+            # Update local status to revised
+            ch.status = ChapterStatus.REVISED
+            db.update_chapter(ch)
+        else:
+            console.print(f"  [error]✗[/] 第{ch.chapter_number}章 {ch.title}: {result['message']}")
+
+    console.print(
+        f"\n[bold]修改完成：[/] [success]{success_count}[/]/{len(eligible)} 章成功提交"
+    )
+    if success_count > 0:
+        console.print("[dim]注意：番茄平台修改后需审核，预计1小时内完成。[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -1257,6 +1662,10 @@ _PROMPT_MAP = {
     "story-architect": ("story_architect.md", "故事架构 — 角色、世界、卷结构设计"),
     "conflict-design": ("conflict_design.md", "冲突设计 — 逐章大纲与冲突安排"),
     "memory-manager":  ("memory_manager.md",  "记忆管理 — 上下文检索与存储"),
+    "short-planner":   ("short_story_planner.md",  "短故事规划 — 概念与大纲"),
+    "short-writer":    ("short_story_writer.md",   "短故事写作 — 创作风格与规则"),
+    "short-editor":    ("short_story_editor.md",   "短故事编辑 — 润色与精炼"),
+    "short-reviewer":  ("short_story_reviewer.md", "短故事审核 — 质量评分"),
 }
 
 
@@ -1310,6 +1719,125 @@ def edit_prompt(name):
 
     filepath.write_text(edited, encoding="utf-8")
     console.print(f"[success]{filename} 已更新[/]")
+
+
+# ---------------------------------------------------------------------------
+# export command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--novel-id", "-n", default=None, type=int, help="小说ID")
+@click.option("--story-id", "-s", default=None, type=int, help="短故事ID")
+@click.option("--output", "-o", default=None, type=click.Path(), help="输出文件路径")
+def export(novel_id, story_id, output):
+    """导出小说或短故事为 Word (.docx) 文件。
+
+    \b
+    示例：
+      opennovel export -n 1                导出小说
+      opennovel export -s 1                导出短故事
+      opennovel export -n 1 -o my.docx     指定输出路径
+    """
+    if not novel_id and not story_id:
+        console.print("[error]请指定 --novel-id (-n) 或 --story-id (-s)[/]")
+        sys.exit(1)
+
+    from tools.word_exporter import export_novel_to_word, export_short_story_to_word
+
+    settings = Settings()
+    db = Database(settings.sqlite_db_path)
+    output_path = Path(output) if output else None
+
+    try:
+        if novel_id:
+            novel = db.get_novel(novel_id)
+            if not novel:
+                console.print(f"[error]未找到ID为 {novel_id} 的小说[/]")
+                sys.exit(1)
+
+            chapters = db.get_chapters(novel_id)
+            total_chars = sum(ch.char_count for ch in chapters)
+
+            console.print(command_panel("导出 Word", {
+                "小说": f"《{novel.title}》",
+                "章节数": f"{len(chapters)} 章",
+                "总字数": f"{total_chars:,} 字",
+            }))
+
+            result_path = export_novel_to_word(db, novel_id, output_path)
+            console.print(success_panel("导出成功", f"文件路径: {result_path.resolve()}"))
+
+        else:
+            story = db.get_short_story(story_id)
+            if not story:
+                console.print(f"[error]未找到ID为 {story_id} 的短故事[/]")
+                sys.exit(1)
+
+            console.print(command_panel("导出 Word", {
+                "短故事": f"《{story.get('title', '?')}》",
+                "字数": f"{story.get('char_count', 0):,} 字",
+            }))
+
+            result_path = export_short_story_to_word(db, story_id, output_path)
+            console.print(success_panel("导出成功", f"文件路径: {result_path.resolve()}"))
+
+    except ValueError as e:
+        console.print(f"[error]{e}[/]")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# update command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("action", required=False, default="check",
+                type=click.Choice(["check", "apply"], case_sensitive=False))
+def update(action):
+    """检查或应用版本更新。
+
+    \b
+    示例：
+      opennovel update            检查是否有新版本
+      opennovel update check      同上
+      opennovel update apply      拉取最新代码并安装
+    """
+    from tools.updater import check_for_updates, apply_update, get_update_log
+
+    if action == "check":
+        console.print("[info]正在检查更新...[/]")
+        info = check_for_updates()
+
+        if info["error"]:
+            console.print(f"[error]检查失败: {info['error']}[/]")
+            sys.exit(1)
+
+        console.print(f"  当前版本: [bold]{info['current_version']}[/]")
+        console.print(f"  当前提交: [muted]{info['current_commit']}[/]")
+
+        if info["has_updates"]:
+            console.print(
+                f"\n  [warning]有 {info['behind_count']} 个新提交可用[/]"
+                f"  [muted](远程: {info['remote_commit']})[/]"
+            )
+            log = get_update_log()
+            if log:
+                console.print("\n  [bold]更新内容:[/]")
+                for line in log.splitlines()[:10]:
+                    console.print(f"    {line}")
+            console.print(f"\n  [info]运行 [bold]opennovel update apply[/] 来更新[/]")
+        else:
+            console.print("\n  [success]已是最新版本[/]")
+
+    elif action == "apply":
+        console.print("[info]正在更新...[/]")
+        result = apply_update()
+
+        if result["success"]:
+            console.print(success_panel(result["message"]))
+        else:
+            console.print(f"[error]{result['message']}[/]")
+            sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

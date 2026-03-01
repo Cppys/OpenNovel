@@ -67,6 +67,7 @@ class WriterAgent(BaseAgent):
         emotional_tone: str = "",
         hook_type: str = "cliffhanger",
         target_chapters: int = 0,
+        existing_titles: str = "",
         on_event: Optional[Callable[[dict], None]] = None,
     ) -> dict:
         """Write a single chapter.
@@ -116,6 +117,7 @@ class WriterAgent(BaseAgent):
             min_chars=self.settings.chapter_min_chars,
             max_chars=self.settings.chapter_max_chars,
             progress_note=progress_note,
+            existing_titles=existing_titles or "（暂无已有标题）",
         )
 
         logger.info(f"Writing chapter {chapter_number}...")

@@ -110,6 +110,29 @@ class PublisherAgent:
             protagonist_name_2=protagonist_name_2,
         )
 
+    async def get_chapter_list(self, book_id: str) -> list[dict]:
+        """Get the chapter list for a book from Fanqie."""
+        return await self._get_client().get_chapter_list(book_id)
+
+    async def get_chapter_content(self, book_id: str, item_id: str) -> dict:
+        """Load a chapter's content for editing from Fanqie."""
+        return await self._get_client().get_chapter_content(book_id, item_id)
+
+    async def modify_chapter(
+        self,
+        book_id: str,
+        item_id: str,
+        content: str,
+        title: str = "",
+    ) -> bool:
+        """Modify an already-published chapter on Fanqie."""
+        return await self._get_client().modify_chapter(
+            book_id=book_id,
+            item_id=item_id,
+            content=content,
+            title=title,
+        )
+
     # ---- Sync wrappers (for CLI) -----------------------------------------
 
     def publish_sync(
@@ -138,6 +161,18 @@ class PublisherAgent:
         """Synchronous wrapper: launch → login → get book list → close."""
         return asyncio.run(self._run_get_book_list())
 
+    def revise_chapters_sync(
+        self,
+        book_id: str,
+        chapters: list[dict],
+    ) -> list[dict]:
+        """Synchronous wrapper: launch → login → modify chapters → close.
+
+        Each chapter dict should have: item_id, content, title (optional).
+        Returns list of result dicts with success/message.
+        """
+        return asyncio.run(self._run_revise_chapters(book_id, chapters))
+
     # ---- Internal async runners -----------------------------------------
 
     async def _run_get_book_list(self) -> list[dict]:
@@ -155,11 +190,16 @@ class PublisherAgent:
         try:
             await self.launch_browser(use_auth_state=True)
             if not await self.ensure_logged_in():
-                return [{
-                    "success": False,
-                    "message": "登录失败——请先运行 opennovel setup-browser 完成登录",
-                    "item_id": "",
-                }]
+                # Return one failure result per chapter so the caller can
+                # report which chapters were not uploaded.
+                return [
+                    {
+                        "success": False,
+                        "message": "登录失败——请先运行 opennovel setup-browser 完成登录",
+                        "item_id": "",
+                    }
+                    for _ in chapters
+                ]
             return await self.publish_chapters(book_id, chapters, publish_mode)
         finally:
             await self.close()
@@ -180,5 +220,52 @@ class PublisherAgent:
             return await self.create_book_on_platform(
                 title, genre, synopsis, protagonist_name_1, protagonist_name_2
             )
+        finally:
+            await self.close()
+
+    async def _run_revise_chapters(
+        self,
+        book_id: str,
+        chapters: list[dict],
+    ) -> list[dict]:
+        """Async runner: launch browser → login → modify chapters → close."""
+        try:
+            await self.launch_browser(use_auth_state=True)
+            if not await self.ensure_logged_in():
+                return [
+                    {
+                        "success": False,
+                        "message": "登录失败——请先运行 opennovel setup-browser 完成登录",
+                        "item_id": ch.get("item_id", ""),
+                    }
+                    for ch in chapters
+                ]
+
+            results = []
+            for ch in chapters:
+                item_id = ch["item_id"]
+                content = ch["content"]
+                title = ch.get("title", "")
+                try:
+                    await self.modify_chapter(
+                        book_id=book_id,
+                        item_id=item_id,
+                        content=content,
+                        title=title,
+                    )
+                    results.append({
+                        "success": True,
+                        "message": f"已提交修改：{title or item_id}",
+                        "item_id": item_id,
+                    })
+                except Exception as e:
+                    logger.error("Failed to modify chapter %s: %s", item_id, e)
+                    results.append({
+                        "success": False,
+                        "message": str(e),
+                        "item_id": item_id,
+                    })
+
+            return results
         finally:
             await self.close()

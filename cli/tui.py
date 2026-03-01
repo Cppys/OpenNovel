@@ -17,7 +17,8 @@ from rich.text import Text
 from rich.markdown import Markdown
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Input, RichLog, Static
+from textual.message import Message
+from textual.widgets import RichLog, Static, TextArea
 from textual import work
 
 logger = logging.getLogger(__name__)
@@ -170,6 +171,40 @@ class _TUIConsole:
         self._app._log_write(content)
 
 
+# ── Chat Input Widget ──────────────────────────────────────────────────
+
+class ChatInput(TextArea):
+    """Chat input using TextArea for reliable paste support.
+
+    Enter submits, Shift+Enter inserts a newline.
+    """
+
+    BINDINGS = [
+        Binding("enter", "submit_input", priority=True),
+    ]
+
+    class Submitted(Message):
+        """Posted when user presses Enter to send a message."""
+
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            show_line_numbers=False,
+            tab_behavior="focus",
+            **kwargs,
+        )
+
+    def action_submit_input(self) -> None:
+        """Submit the current text content."""
+        text = self.text.strip()
+        if text:
+            self.post_message(self.Submitted(text))
+            self.text = ""
+
+
 class OpenNovelTUI(App):
     """OpenNovel Textual TUI application."""
 
@@ -208,7 +243,7 @@ class OpenNovelTUI(App):
     }
 
     #input_box {
-        height: 3;
+        height: 4;
         border: double #30363d;
         background: #161b22;
         padding: 0 1;
@@ -222,6 +257,7 @@ class OpenNovelTUI(App):
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "退出"),
+        Binding("ctrl+q", "quit", "退出"),
         Binding("ctrl+l", "clear_chat", "清空"),
         Binding("escape", "interrupt_or_quit", "中断/退出", priority=True),
     ]
@@ -237,7 +273,7 @@ class OpenNovelTUI(App):
         yield RichLog(id="chat_log", markup=True, highlight=True)
         yield Static("", id="node_graph")
         yield Static("", id="ai_status")
-        yield Input(placeholder="描述你想做的事... (/help 查看命令)", id="input_box")
+        yield ChatInput(id="input_box")
 
     def on_mount(self) -> None:
         self.session.console = _TUIConsole(self)
@@ -264,7 +300,7 @@ class OpenNovelTUI(App):
             logging.getLogger(name).setLevel(logging.WARNING)
 
         self._render_welcome()
-        self.query_one("#input_box", Input).focus()
+        self.query_one("#input_box", ChatInput).focus()
 
     # ── Welcome Screen ────────────────────────────────────────────────────
 
@@ -342,14 +378,14 @@ class OpenNovelTUI(App):
         shortcuts.append("ctrl+c", style="bold #8b949e")
         shortcuts.append(" 退出", style="dim")
         shortcuts.append("    ", style="")
+        shortcuts.append("ctrl+q", style="bold #8b949e")
+        shortcuts.append(" 退出", style="dim")
+        shortcuts.append("    ", style="")
         shortcuts.append("ctrl+l", style="bold #8b949e")
         shortcuts.append(" 清屏", style="dim")
         shortcuts.append("    ", style="")
-        shortcuts.append("/help", style="bold #8b949e")
-        shortcuts.append(" 帮助", style="dim")
-        shortcuts.append("    ", style="")
-        shortcuts.append("/clear", style="bold #8b949e")
-        shortcuts.append(" 清空历史", style="dim")
+        shortcuts.append("esc", style="bold #8b949e")
+        shortcuts.append(" 中断AI", style="dim")
         log.write(shortcuts)
 
         # Separator
@@ -437,14 +473,14 @@ class OpenNovelTUI(App):
 
     # ── Input handling ────────────────────────────────────────────────────
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         user_msg = event.value.strip()
         if not user_msg:
             return
 
-        inp = self.query_one("#input_box", Input)
+        inp = self.query_one("#input_box", ChatInput)
         log = self.query_one("#chat_log", RichLog)
-        inp.value = ""
+        inp.text = ""
 
         echo = Text()
         echo.append("> ", style="bright_blue bold")
@@ -460,7 +496,6 @@ class OpenNovelTUI(App):
             return
 
         inp.disabled = True
-        inp.placeholder = ""
         self._cancel_event.clear()
         self._ai_running = True
         self._ai_worker = self._run_ai(user_msg)
@@ -488,9 +523,8 @@ class OpenNovelTUI(App):
         self._ai_running = False
         self._hide_ai_status()
         self._hide_node_graph()
-        inp = self.query_one("#input_box", Input)
+        inp = self.query_one("#input_box", ChatInput)
         inp.disabled = False
-        inp.placeholder = "描述你想做的事... (/help 查看命令)"
         inp.focus()
 
     # ── Actions ───────────────────────────────────────────────────────────

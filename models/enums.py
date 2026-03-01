@@ -16,6 +16,7 @@ class ChapterStatus(str, Enum):
     EDITED = "edited"
     REVIEWED = "reviewed"
     PUBLISHED = "published"
+    REVISED = "revised"
 
 
 class CharacterRole(str, Enum):
@@ -38,6 +39,7 @@ class EventType(str, Enum):
     TWIST = "twist"
     SETUP = "setup"
     RESOLUTION = "resolution"
+    INCONSISTENCY = "inconsistency"
 
 
 class EventImportance(str, Enum):
@@ -71,3 +73,12 @@ class EmotionalTone(str, Enum):
     ROMANTIC = "浪漫"
     DARK = "黑暗"
     CALM = "平静"
+
+
+class ShortStoryStatus(str, Enum):
+    PLANNING = "planning"
+    WRITING = "writing"
+    EDITING = "editing"
+    REVIEWING = "reviewing"
+    DRAFT = "draft"          # Saved as draft on Fanqie
+    PUBLISHED = "published"

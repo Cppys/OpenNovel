@@ -26,17 +26,27 @@ os.environ.pop("CLAUDECODE", None)
 # On Windows the bundled Claude Code CLI needs git-bash.
 # Auto-detect if CLAUDE_CODE_GIT_BASH_PATH is not already set.
 if sys.platform == "win32" and not os.environ.get("CLAUDE_CODE_GIT_BASH_PATH"):
-    # Check well-known git-bash locations first
-    _candidates = [
-        r"D:\git\usr\bin\bash.exe",
+    _candidates = []
+
+    # Derive Git bash from `where git` / shutil.which("git")
+    _git_exe = shutil.which("git")
+    if _git_exe:
+        # git.exe is typically at <GIT_ROOT>/cmd/git.exe or <GIT_ROOT>/bin/git.exe
+        _git_root = os.path.dirname(os.path.dirname(os.path.abspath(_git_exe)))
+        _candidates.append(os.path.join(_git_root, "usr", "bin", "bash.exe"))
+        _candidates.append(os.path.join(_git_root, "bin", "bash.exe"))
+
+    # Common install locations as fallback
+    _candidates += [
         r"C:\Program Files\Git\usr\bin\bash.exe",
         r"C:\Program Files\Git\bin\bash.exe",
         r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
     ]
-    # Also try shutil.which, but skip WSL/Windows-Apps bash
-    _which = shutil.which("bash")
-    if _which and "System32" not in _which and "WindowsApps" not in _which:
-        _candidates.insert(0, _which)
+
+    # Also try shutil.which("bash"), but skip WSL / Windows-Apps bash
+    _which_bash = shutil.which("bash")
+    if _which_bash and "System32" not in _which_bash and "WindowsApps" not in _which_bash:
+        _candidates.append(_which_bash)
 
     for _p in _candidates:
         if os.path.exists(_p):
@@ -104,10 +114,8 @@ class AgentSDKClient:
                 options_kwargs["permission_mode"] = "bypassPermissions"
                 git_bash = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
                 if git_bash:
-                    # Use Git Bash to avoid WSL popup windows on Windows
                     options_kwargs["env"] = {"CLAUDE_CODE_GIT_BASH_PATH": git_bash}
                 elif sys.platform == "win32":
-                    # No Git Bash found — disable Bash tool to avoid WSL popups
                     options_kwargs["disallowed_tools"] = ["Bash"]
             async for message in query(
                 prompt=user_prompt,

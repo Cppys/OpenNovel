@@ -1,6 +1,7 @@
 """Base agent class with common LLM and prompt utilities."""
 
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,9 @@ from tools.agent_sdk_client import AgentSDKClient
 logger = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent.parent / "config" / "prompts"
+
+# Matches {identifier} but not {{ or }} (pre-escaped for .format())
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
 @lru_cache(maxsize=32)
@@ -61,3 +65,29 @@ class BaseAgent:
             elif capturing:
                 result.append(line)
         return "\n".join(result).strip()
+
+    @staticmethod
+    def _safe_format(template: str, **kwargs) -> str:
+        """Safely substitute {placeholders} in a template string.
+
+        Unlike str.format(), this method:
+        - Only replaces placeholders whose keys are in **kwargs
+        - Leaves unknown {placeholders} and raw {} (JSON examples) untouched
+        - Handles {{double-braces}} as literal braces (same as str.format)
+
+        This is essential for prompt templates that contain JSON examples
+        with raw curly braces that would crash Python's str.format().
+        """
+        def _replacer(match: re.Match) -> str:
+            key = match.group(1)
+            if key in kwargs:
+                return str(kwargs[key])
+            return match.group(0)  # Leave unknown placeholders as-is
+
+        # First, temporarily protect already-escaped {{ and }}
+        result = template.replace("{{", "\x00LBRACE\x00").replace("}}", "\x00RBRACE\x00")
+        # Replace only known placeholders
+        result = _PLACEHOLDER_RE.sub(_replacer, result)
+        # Restore escaped braces to literal { and }
+        result = result.replace("\x00LBRACE\x00", "{").replace("\x00RBRACE\x00", "}")
+        return result
